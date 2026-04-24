@@ -198,27 +198,43 @@ export async function dumpSource(): Promise<string> {
 }
 
 export async function findElement(strategy: string, selector: string): Promise<string> {
-  // Appium UIAutomator2 server changed the body shape — older versions accept
-  // `{using, value}` (W3C-ish), v9+ expects `{strategy, selector}`. Try both.
-  const bodies: Record<string, string>[] = [
-    { strategy, selector },
-    { using: strategy, value: selector },
-  ];
-  let lastErr: unknown = null;
-  for (const body of bodies) {
-    try {
-      const v = (await u2("POST", "/element", body)) as {
-        ELEMENT?: string;
-        "element-6066-11e4-a52e-4f735466cecf"?: string;
-      };
-      const id = v?.ELEMENT || v?.["element-6066-11e4-a52e-4f735466cecf"];
-      if (id) return id;
-    } catch (e) {
-      lastErr = e;
-      continue;
+  // Appium UIAutomator2 v9+ expects { strategy, selector }. Earlier versions
+  // expect { using, value }. Try v9 first, log the actual response when we
+  // don't find ELEMENT so we can adapt to quirks.
+  const v9Body = { strategy, selector };
+  try {
+    const v = (await u2("POST", "/element", v9Body)) as unknown;
+    const id = extractElementId(v);
+    if (id) return id;
+    // If the server returns a non-id shape, log it so we can debug.
+    // eslint-disable-next-line no-console
+    console.error("[android-mcp] findElement v9 body returned unexpected shape:", JSON.stringify(v).slice(0, 400));
+  } catch (e) {
+    // Fall through to legacy
+    const msg = (e as Error).message || String(e);
+    if (!/selector|strategy|not present/i.test(msg)) {
+      // Not a field-shape error — actual "not found" or server issue. Re-throw.
+      throw e;
     }
   }
-  throw new Error(`findElement failed: ${(lastErr as Error)?.message || "unknown"}`);
+  // Legacy body for older servers.
+  const v = (await u2("POST", "/element", { using: strategy, value: selector })) as unknown;
+  const id = extractElementId(v);
+  if (id) return id;
+  throw new Error(`findElement failed: ${JSON.stringify(v).slice(0, 300)}`);
+}
+
+function extractElementId(v: unknown): string | null {
+  if (!v || typeof v !== "object") return null;
+  const o = v as Record<string, unknown>;
+  // Standard W3C: { "element-6066-11e4-a52e-4f735466cecf": "..." }
+  const w3c = o["element-6066-11e4-a52e-4f735466cecf"];
+  if (typeof w3c === "string") return w3c;
+  // JSONWP: { ELEMENT: "..." }
+  if (typeof o.ELEMENT === "string") return o.ELEMENT;
+  // Some servers nest the element id inside a wrapper
+  if (typeof o.value === "object" && o.value != null) return extractElementId(o.value);
+  return null;
 }
 
 export async function clickElement(elId: string) {
@@ -240,4 +256,94 @@ export async function screenshot(): Promise<string> {
 
 export async function pressKeyCode(keycode: number) {
   await u2("POST", "/appium/device/press_keycode", { keycode });
+}
+
+/**
+ * Detects and dismisses React Native LogBox dev overlays — both the full-screen
+ * stack-trace view (has "Dismiss" + "Minimize" buttons) and the minimized badges
+ * that stack at the bottom of the screen. Called automatically before every
+ * interactive tool so dev warnings can't block automation.
+ *
+ * Returns the number of overlays dismissed (0 if none).
+ */
+export async function dismissDevOverlay(): Promise<{
+  full_screen: boolean;
+  badges_dismissed: number;
+}> {
+  try {
+    const xml = await dumpSource();
+    let fullScreen = false;
+    let badges = 0;
+
+    // Detect full-screen LogBox: has both "Dismiss" and "Minimize" desc.
+    if (/content-desc="Minimize"/.test(xml) && /content-desc="Dismiss"/.test(xml)) {
+      fullScreen = true;
+      // Minimize (not Dismiss) so warnings remain reachable as badges.
+      try {
+        const elId = await findElement("accessibility id", "Minimize");
+        await clickElement(elId);
+        await new Promise((r) => setTimeout(r, 300));
+      } catch {
+        // if Minimize fails, try Dismiss
+        try {
+          const elId = await findElement("accessibility id", "Dismiss");
+          await clickElement(elId);
+          await new Promise((r) => setTimeout(r, 300));
+        } catch { /* noop */ }
+      }
+      // Re-dump to check for badges after minimize
+      return dismissDevOverlay().then((r) => ({
+        full_screen: true,
+        badges_dismissed: r.badges_dismissed,
+      }));
+    }
+
+    // Detect minimized badges. Pattern: content-desc starting with "!, " or
+    // "<digit>, " and containing typical warning markers.
+    const badgeRe = /<node[^>]*?content-desc="(?:!|\d+),\s[^"]*"[^>]*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/g;
+    let m: RegExpExecArray | null;
+    const toClose: Array<{ x: number; y: number }> = [];
+    while ((m = badgeRe.exec(xml))) {
+      const [, , y1, x2, y2] = m;
+      const top = Number(y1);
+      const right = Number(x2);
+      const bottom = Number(y2);
+      // Badges are pinned near the bottom of the screen.
+      if (top < 1800) continue;
+      // Close icon is typically in the right ~85px of the badge, vertically centered.
+      toClose.push({ x: right - 58, y: Math.round((top + bottom) / 2) });
+    }
+
+    for (const pt of toClose) {
+      // Use a raw tap via UIAutomator2's mouse endpoint to avoid relying on a selector.
+      // Fallback: adb input tap via a new shell command. Since we don't have that
+      // helper here, use the UIAutomator2 /appium/tap endpoint if available, else
+      // press_keycode won't help. Use "perform" actions sequence.
+      try {
+        await u2("POST", "/actions", {
+          actions: [
+            {
+              type: "pointer",
+              id: "finger1",
+              parameters: { pointerType: "touch" },
+              actions: [
+                { type: "pointerMove", duration: 0, x: pt.x, y: pt.y },
+                { type: "pointerDown", button: 0 },
+                { type: "pause", duration: 50 },
+                { type: "pointerUp", button: 0 },
+              ],
+            },
+          ],
+        });
+        badges++;
+        await new Promise((r) => setTimeout(r, 250));
+      } catch {
+        // if actions endpoint not supported, swallow silently
+      }
+    }
+
+    return { full_screen: fullScreen, badges_dismissed: badges };
+  } catch {
+    return { full_screen: false, badges_dismissed: 0 };
+  }
 }

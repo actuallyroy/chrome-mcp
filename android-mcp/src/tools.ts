@@ -19,6 +19,7 @@ import {
 import {
   clearElement,
   clickElement,
+  dismissDevOverlay,
   pressKeyCode,
   screenshot as u2Screenshot,
   setElementValue,
@@ -319,6 +320,13 @@ export const tools: Tool[] = [
       await u2("POST", "/orientation", { orientation });
       return text(`oriented ${orientation}`);
     },
+  },
+  {
+    name: "dismiss_dev_overlay",
+    description:
+      "Dismiss React Native LogBox dev overlays (full-screen stack-trace view and minimized warning badges). Called automatically before every interactive tool; expose as an explicit tool for debugging.",
+    schema: z.object({}),
+    handler: async () => json(await dismissDevOverlay()),
   },
   {
     name: "open_notifications",

@@ -8,6 +8,21 @@ import {
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { tools } from "./tools.js";
 import { recordCall } from "./recorder.js";
+import { dismissDevOverlay } from "./uiautomator2.js";
+
+// Tools that skip auto-dismiss: the dismiss itself (would recurse), and the
+// "pure read / non-interactive" tools where speed matters more than overlay
+// cleanliness. Everything else gets auto-dismiss before execution.
+const SKIP_AUTO_DISMISS = new Set<string>([
+  "dismiss_dev_overlay",
+  "list_devices",
+  "select_device",
+  "device_info",
+  "get_logcat",
+  "recording_status",
+  "start_recording",
+  "stop_recording",
+]);
 
 const server = new Server(
   { name: "android-mcp", version: "0.1.0" },
@@ -28,6 +43,9 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     return { content: [{ type: "text", text: `Unknown tool: ${req.params.name}` }], isError: true };
   }
   const rawArgs = req.params.arguments ?? {};
+  if (!SKIP_AUTO_DISMISS.has(tool.name)) {
+    try { await dismissDevOverlay(); } catch { /* best-effort */ }
+  }
   try {
     const args = tool.schema.parse(rawArgs);
     const result = await tool.handler(args as Record<string, unknown>);
