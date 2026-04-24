@@ -193,7 +193,7 @@ export const tools: Tool[] = [
   {
     name: "screenshot",
     description:
-      "PNG screenshot of the current device screen (base64). Automatically downscaled so the longest side is ≤1600px (MCP image limit is 2000px).",
+      "PNG screenshot of the current device screen (base64), auto-downscaled to fit the MCP 2000px image limit. Prefer `outline` for navigation and element lookup — it's cheaper, faster, and returns stable refs. Use screenshot only for visual verification, layout bugs, or content the view hierarchy can't describe (canvas, charts, map tiles, rendered images).",
     schema: z.object({
       max_dim: z.number().int().min(256).max(2000).default(1600),
     }),

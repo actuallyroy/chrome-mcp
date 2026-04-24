@@ -67,9 +67,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     if (INTERACTIVE_TOOLS.has(tool.name)) {
       // Dev overlays spawned by this action can still block the next call.
       try { await dismissDevOverlay(); } catch { /* best-effort */ }
-      // Give the UI a tiny beat to settle before sampling.
-      await new Promise((r) => setTimeout(r, 150));
-      const after = await fingerprint().catch(() => "");
+      // Sample twice with a gap — animated bottom-sheet / modal transitions
+      // can take ~200-400ms. If either sample differs from before, it changed.
+      await new Promise((r) => setTimeout(r, 200));
+      let after = await fingerprint().catch(() => "");
+      if (before && after === before) {
+        await new Promise((r) => setTimeout(r, 250));
+        after = await fingerprint().catch(() => "");
+      }
       if (before && after) {
         const changed = before !== after;
         const navHint =

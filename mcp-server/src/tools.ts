@@ -637,7 +637,7 @@ export const tools: Tool[] = [
   {
     name: "screenshot",
     description:
-      "Take a PNG screenshot of the active tab. Set full_page=true for the full scrollable area.",
+      "Take a PNG screenshot of the active tab. Set full_page=true for the full scrollable area. Prefer `outline` for navigation and element lookup — it's cheaper, faster, and returns stable refs. Use screenshot only for visual verification, layout bugs, or content the DOM can't describe (canvas, charts, rendered media).",
     schema: z.object({ full_page: z.boolean().default(false) }),
     handler: async (args) =>
       withPage(async (p) => {
