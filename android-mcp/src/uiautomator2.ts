@@ -198,13 +198,27 @@ export async function dumpSource(): Promise<string> {
 }
 
 export async function findElement(strategy: string, selector: string): Promise<string> {
-  const v = (await u2("POST", "/element", { using: strategy, value: selector })) as {
-    ELEMENT?: string;
-    "element-6066-11e4-a52e-4f735466cecf"?: string;
-  };
-  const id = v?.ELEMENT || v?.["element-6066-11e4-a52e-4f735466cecf"];
-  if (!id) throw new Error(`findElement returned no id: ${JSON.stringify(v)}`);
-  return id;
+  // Appium UIAutomator2 server changed the body shape — older versions accept
+  // `{using, value}` (W3C-ish), v9+ expects `{strategy, selector}`. Try both.
+  const bodies: Record<string, string>[] = [
+    { strategy, selector },
+    { using: strategy, value: selector },
+  ];
+  let lastErr: unknown = null;
+  for (const body of bodies) {
+    try {
+      const v = (await u2("POST", "/element", body)) as {
+        ELEMENT?: string;
+        "element-6066-11e4-a52e-4f735466cecf"?: string;
+      };
+      const id = v?.ELEMENT || v?.["element-6066-11e4-a52e-4f735466cecf"];
+      if (id) return id;
+    } catch (e) {
+      lastErr = e;
+      continue;
+    }
+  }
+  throw new Error(`findElement failed: ${(lastErr as Error)?.message || "unknown"}`);
 }
 
 export async function clickElement(elId: string) {
