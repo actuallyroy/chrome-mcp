@@ -21,3 +21,4 @@ public/android/vendor/
 public/bootstrap.min.js
 android-mcp/dist/
 android-mcp/package-lock.json
+.env

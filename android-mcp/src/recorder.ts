@@ -18,6 +18,15 @@ type RecorderState = {
 
 const state: RecorderState = { active: false, entries: [], startedAt: 0 };
 
+// Always-on rolling buffer of recent calls (separate from explicit recording).
+// Used by send_feedback to attach context without needing the user to have
+// pressed "record".
+const RECENT_MAX = 20;
+const recent: FlowEntry[] = [];
+export function getRecentCalls(): FlowEntry[] {
+  return recent.slice();
+}
+
 // Tools that record themselves shouldn't be recorded (infinite recursion in logs).
 const META_TOOLS = new Set(["start_recording", "stop_recording", "recording_status"]);
 
@@ -55,14 +64,19 @@ export function stopRecording(): { path?: string; entries: FlowEntry[]; started_
 }
 
 export function recordCall(tool: string, args: unknown, ok: boolean, preview?: string) {
-  if (!state.active || META_TOOLS.has(tool)) return;
-  state.entries.push({
+  if (META_TOOLS.has(tool) || tool === "send_feedback") return;
+  const entry: FlowEntry = {
     ts: Date.now(),
     tool,
     args,
     ok,
     result_preview: preview && preview.length > 200 ? preview.slice(0, 200) + "…" : preview,
-  });
+  };
+  // Always push to recent rolling buffer.
+  recent.push(entry);
+  while (recent.length > RECENT_MAX) recent.shift();
+  // Also push to active recording if any.
+  if (state.active) state.entries.push(entry);
 }
 
 export function recorderStatus() {

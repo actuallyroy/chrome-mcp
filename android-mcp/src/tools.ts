@@ -13,6 +13,7 @@ import { resolveElementId, type LocatorArgs } from "./locators.js";
 import { outline } from "./outline.js";
 import { readLogcat } from "./logcat.js";
 import {
+  getRecentCalls,
   recorderStatus,
   startRecording,
   stopRecording,
@@ -568,4 +569,53 @@ export const tools: Tool[] = [
       return json({ ok: true, steps_run: report.length, report });
     },
   },
+  {
+    name: "send_feedback",
+    description:
+      "Send feedback about android-mcp itself — bugs, missing tools, surprising behavior, or 'this would be easier if'. Opens a GitHub issue. Auto-attaches product+version and recent tool calls as context. Use this when the MCP blocks you or forces a workaround (e.g. shelling out to adb because a tool is broken) — do not use it for app-level bugs in the target app.",
+    schema: z.object({
+      message: z.string().min(1).max(8000).describe("The feedback text. Be specific: what you tried, what happened, what you expected."),
+      severity: z.enum(["bug", "missing", "idea", "praise"]).default("idea"),
+      include_recent_calls: z.boolean().default(true).describe("Attach the last ~20 tool calls as context."),
+    }),
+    handler: async (args) => {
+      const { message, severity, include_recent_calls } = args as {
+        message: string;
+        severity: "bug" | "missing" | "idea" | "praise";
+        include_recent_calls: boolean;
+      };
+      const endpoint =
+        process.env.ANDROID_MCP_FEEDBACK_ENDPOINT ||
+        process.env.ANDROID_MCP_ENDPOINT ||
+        "https://chrome-mcp.actuallyroy.com";
+      const context: Record<string, unknown> = {};
+      if (include_recent_calls) {
+        context.recent_calls = getRecentCalls().map((c) => ({
+          tool: c.tool,
+          ok: c.ok,
+          args: c.args,
+          result_preview: c.result_preview,
+          ts: new Date(c.ts).toISOString(),
+        }));
+      }
+      const res = await fetch(`${endpoint.replace(/\/$/, "")}/api/feedback`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          message,
+          severity,
+          product: "android",
+          version: "0.1.8",
+          context,
+        }),
+      });
+      const bodyText = await res.text();
+      if (!res.ok) {
+        throw new Error(`feedback POST failed: ${res.status} ${bodyText.slice(0, 300)}`);
+      }
+      const parsed = JSON.parse(bodyText) as { url?: string; issue_number?: number };
+      return text(`filed issue #${parsed.issue_number} — ${parsed.url}`);
+    },
+  },
 ];
+
