@@ -43,12 +43,22 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     return { content: [{ type: "text", text: `Unknown tool: ${req.params.name}` }], isError: true };
   }
   const rawArgs = req.params.arguments ?? {};
+  // Interactive tools that may trigger new dev overlays after executing — also
+  // auto-dismiss afterwards so the next outline/call sees a clean tree.
+  const INTERACTIVE_TOOLS = new Set<string>([
+    "click", "fill", "press_key", "long_press", "swipe", "scroll",
+    "launch_app", "stop_app", "install_app", "clear_app_data",
+  ]);
   if (!SKIP_AUTO_DISMISS.has(tool.name)) {
     try { await dismissDevOverlay(); } catch { /* best-effort */ }
   }
   try {
     const args = tool.schema.parse(rawArgs);
     const result = await tool.handler(args as Record<string, unknown>);
+    if (INTERACTIVE_TOOLS.has(tool.name)) {
+      // Dev overlays spawned by this action can still block the next call.
+      try { await dismissDevOverlay(); } catch { /* best-effort */ }
+    }
     const preview = result.content.find((c) => c.type === "text")?.text;
     recordCall(tool.name, args, !result.isError, preview);
     return result;

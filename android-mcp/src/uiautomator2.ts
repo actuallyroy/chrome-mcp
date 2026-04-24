@@ -266,83 +266,150 @@ export async function pressKeyCode(keycode: number) {
  *
  * Returns the number of overlays dismissed (0 if none).
  */
+// Signatures that indicate a React Native LogBox badge (we want to dismiss these).
+const DEV_BADGE_SIGNALS = [
+  "[MIXPANEL",
+  "[NOTIFICATION",
+  "[StartDay]",
+  "[StoreDetailsScreen]",
+  "unhandled promise rejection",
+  "Possible unhandled",
+  "Failed to send",
+  "AxiosError",
+  "Network Error",
+  "❌",
+  "⚠️",
+];
+
+type XmlNode = {
+  attrs: Record<string, string>;
+  children: XmlNode[];
+};
+
+function parseXmlLite(xml: string): XmlNode | null {
+  let s = xml.replace(/<\?xml[^?]*\?>/g, "").replace(/<!--[\s\S]*?-->/g, "");
+  const stack: XmlNode[] = [];
+  let root: XmlNode | null = null;
+  const tagRe = /<\s*(\/?)([a-zA-Z_][\w.\-:]*)\s*((?:[^<>"']|"[^"]*"|'[^']*')*?)\s*(\/?)>/g;
+  let m: RegExpExecArray | null;
+  while ((m = tagRe.exec(s))) {
+    const [, slash, , attrStr, selfClose] = m;
+    if (slash === "/") {
+      stack.pop();
+      continue;
+    }
+    const attrs: Record<string, string> = {};
+    const attrRe = /([a-zA-Z_][\w.\-:]*)\s*=\s*"([^"]*)"/g;
+    let a: RegExpExecArray | null;
+    while ((a = attrRe.exec(attrStr))) attrs[a[1]] = a[2];
+    const node: XmlNode = { attrs, children: [] };
+    if (!root) root = node;
+    if (stack.length > 0) stack[stack.length - 1].children.push(node);
+    if (selfClose !== "/") stack.push(node);
+  }
+  return root;
+}
+
+function parseBounds(s: string): { l: number; t: number; r: number; b: number } | null {
+  const m = s?.match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
+  return m ? { l: +m[1], t: +m[2], r: +m[3], b: +m[4] } : null;
+}
+
+async function tap(x: number, y: number) {
+  try {
+    await u2("POST", "/actions", {
+      actions: [
+        {
+          type: "pointer",
+          id: "finger1",
+          parameters: { pointerType: "touch" },
+          actions: [
+            { type: "pointerMove", duration: 0, x, y },
+            { type: "pointerDown", button: 0 },
+            { type: "pause", duration: 50 },
+            { type: "pointerUp", button: 0 },
+          ],
+        },
+      ],
+    });
+  } catch {
+    // Fallback to adb input tap.
+    await adbShell(`input tap ${x} ${y}`).catch(() => {});
+  }
+}
+
+/**
+ * Detects and dismisses React Native LogBox dev overlays — both the full-screen
+ * stack-trace view (has "Dismiss" + "Minimize" buttons) and the minimized badges
+ * that stack at the bottom of the screen. Called automatically before every
+ * interactive tool so dev warnings can't block automation.
+ */
 export async function dismissDevOverlay(): Promise<{
   full_screen: boolean;
   badges_dismissed: number;
 }> {
   try {
     const xml = await dumpSource();
-    let fullScreen = false;
-    let badges = 0;
+    const root = parseXmlLite(xml);
+    if (!root) return { full_screen: false, badges_dismissed: 0 };
 
-    // Detect full-screen LogBox: has both "Dismiss" and "Minimize" desc.
-    if (/content-desc="Minimize"/.test(xml) && /content-desc="Dismiss"/.test(xml)) {
-      fullScreen = true;
-      // Minimize (not Dismiss) so warnings remain reachable as badges.
+    // Collect all nodes with their bounds and content-desc.
+    type Match = { desc: string; bounds: { l: number; t: number; r: number; b: number } };
+    const matches: Match[] = [];
+    let hasMinimize = false;
+    let hasDismiss = false;
+    (function walk(n: XmlNode) {
+      const desc = n.attrs["content-desc"] || "";
+      if (desc === "Minimize") hasMinimize = true;
+      if (desc === "Dismiss") hasDismiss = true;
+      const b = parseBounds(n.attrs.bounds || "");
+      if (b && desc && DEV_BADGE_SIGNALS.some((sig) => desc.includes(sig))) {
+        matches.push({ desc, bounds: b });
+      }
+      for (const c of n.children) walk(c);
+    })(root);
+
+    // Full-screen LogBox: Dismiss + Minimize both present.
+    if (hasMinimize && hasDismiss) {
       try {
         const elId = await findElement("accessibility id", "Minimize");
         await clickElement(elId);
-        await new Promise((r) => setTimeout(r, 300));
       } catch {
-        // if Minimize fails, try Dismiss
         try {
           const elId = await findElement("accessibility id", "Dismiss");
           await clickElement(elId);
-          await new Promise((r) => setTimeout(r, 300));
         } catch { /* noop */ }
       }
-      // Re-dump to check for badges after minimize
-      return dismissDevOverlay().then((r) => ({
-        full_screen: true,
-        badges_dismissed: r.badges_dismissed,
-      }));
+      await new Promise((r) => setTimeout(r, 300));
+      const recurse = await dismissDevOverlay();
+      return { full_screen: true, badges_dismissed: recurse.badges_dismissed };
     }
 
-    // Detect minimized badges. Pattern: content-desc starting with "!, " or
-    // "<digit>, " and containing typical warning markers.
-    const badgeRe = /<node[^>]*?content-desc="(?:!|\d+),\s[^"]*"[^>]*?bounds="\[(\d+),(\d+)\]\[(\d+),(\d+)\]"/g;
-    let m: RegExpExecArray | null;
-    const toClose: Array<{ x: number; y: number }> = [];
-    while ((m = badgeRe.exec(xml))) {
-      const [, , y1, x2, y2] = m;
-      const top = Number(y1);
-      const right = Number(x2);
-      const bottom = Number(y2);
-      // Badges are pinned near the bottom of the screen.
-      if (top < 1800) continue;
-      // Close icon is typically in the right ~85px of the badge, vertically centered.
-      toClose.push({ x: right - 58, y: Math.round((top + bottom) / 2) });
-    }
-
-    for (const pt of toClose) {
-      // Use a raw tap via UIAutomator2's mouse endpoint to avoid relying on a selector.
-      // Fallback: adb input tap via a new shell command. Since we don't have that
-      // helper here, use the UIAutomator2 /appium/tap endpoint if available, else
-      // press_keycode won't help. Use "perform" actions sequence.
-      try {
-        await u2("POST", "/actions", {
-          actions: [
-            {
-              type: "pointer",
-              id: "finger1",
-              parameters: { pointerType: "touch" },
-              actions: [
-                { type: "pointerMove", duration: 0, x: pt.x, y: pt.y },
-                { type: "pointerDown", button: 0 },
-                { type: "pause", duration: 50 },
-                { type: "pointerUp", button: 0 },
-              ],
-            },
-          ],
-        });
-        badges++;
-        await new Promise((r) => setTimeout(r, 250));
-      } catch {
-        // if actions endpoint not supported, swallow silently
+    // Deduplicate by bounds (same badge can appear multiple times in the tree
+    // because content-desc is set on both the outer ViewGroup and inner children).
+    const uniqueByTop = new Map<string, Match>();
+    for (const m2 of matches) {
+      const key = `${m2.bounds.t}:${m2.bounds.b}`;
+      const existing = uniqueByTop.get(key);
+      if (!existing || m2.bounds.r - m2.bounds.l > existing.bounds.r - existing.bounds.l) {
+        uniqueByTop.set(key, m2);
       }
     }
 
-    return { full_screen: fullScreen, badges_dismissed: badges };
+    let badges = 0;
+    // Tap each badge's close icon in reverse order (topmost first) so
+    // shifting doesn't throw coords off.
+    const sorted = [...uniqueByTop.values()].sort((a, b) => b.bounds.t - a.bounds.t);
+    for (const m2 of sorted) {
+      // Close icon is always in the right ~60px, vertically centered on the badge.
+      const x = m2.bounds.r - 60;
+      const y = Math.round((m2.bounds.t + m2.bounds.b) / 2);
+      await tap(x, y);
+      badges++;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    return { full_screen: false, badges_dismissed: badges };
   } catch {
     return { full_screen: false, badges_dismissed: 0 };
   }

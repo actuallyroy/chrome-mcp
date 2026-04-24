@@ -1,6 +1,6 @@
 import { readFileSync, unlinkSync } from "node:fs";
 import { z } from "zod";
-import { adb, adbShell } from "./adb.js";
+import { adb, adbShell, screenSize } from "./adb.js";
 import {
   currentApp,
   deviceInfo,
@@ -187,14 +187,36 @@ export const tools: Tool[] = [
   },
   {
     name: "fill",
-    description: "Clear and type into a text field. Locator + value.",
+    description: "Clear and type into a text field. Locator + value. Automatically falls back to click+adb-input for React Native TextInputs that reject the WebDriver setValue call.",
     schema: z.object({ ...Locator, value: z.string() }),
     handler: async (args) => {
       const { value, ...loc } = args as LocatorArgs & { value: string };
       const elId = await resolveElementId(loc);
-      await clearElement(elId);
-      await setElementValue(elId, value);
-      return text(`filled`);
+      try {
+        await clearElement(elId);
+        await setElementValue(elId, value);
+        return text(`filled`);
+      } catch (e) {
+        const msg = (e as Error).message || "";
+        // Typical RN TextInput error: "Cannot set the element to '<value>'. Did you interact with the correct element?"
+        if (!/invalid element state|Cannot set the element|Did you interact/i.test(msg)) throw e;
+        // Fallback: click the element to focus it, then use adb shell input text.
+        await clickElement(elId);
+        // Clear any existing content: move to end, delete back a bunch of times.
+        await adbShell("input keyevent KEYCODE_MOVE_END").catch(() => {});
+        for (let i = 0; i < 40; i++) {
+          await adbShell("input keyevent KEYCODE_DEL").catch(() => {});
+        }
+        // `adb shell input text` uses %s for space and needs quoting for shell metas.
+        const escaped = value
+          .replace(/\\/g, "\\\\")
+          .replace(/"/g, '\\"')
+          .replace(/`/g, "\\`")
+          .replace(/\$/g, "\\$")
+          .replace(/ /g, "%s");
+        await adbShell(`input text "${escaped}"`);
+        return text(`filled (adb fallback)`);
+      }
     },
   },
   {
@@ -266,9 +288,7 @@ export const tools: Tool[] = [
           throw new Error(`scroll until "${until_text}" failed: ${(e as Error).message}`);
         }
       }
-      const screen = (await u2("GET", "/window/rect")) as { width: number; height: number };
-      const w = screen.width || 1080;
-      const h = screen.height || 2000;
+      const { w, h } = await screenSize();
       const mx = w / 2;
       const my = h / 2;
       for (let i = 0; i < max_steps; i++) {
@@ -327,6 +347,36 @@ export const tools: Tool[] = [
       "Dismiss React Native LogBox dev overlays (full-screen stack-trace view and minimized warning badges). Called automatically before every interactive tool; expose as an explicit tool for debugging.",
     schema: z.object({}),
     handler: async () => json(await dismissDevOverlay()),
+  },
+  {
+    name: "wait_for_stable",
+    description:
+      "Wait until the UI tree stops changing (two consecutive snapshots identical). Useful after a click triggers async re-renders. Returns once stable or at the timeout.",
+    schema: z.object({
+      timeout_ms: z.number().int().min(100).default(3000),
+      poll_ms: z.number().int().min(50).default(250),
+    }),
+    handler: async (args) => {
+      const { timeout_ms, poll_ms } = args as { timeout_ms: number; poll_ms: number };
+      const deadline = Date.now() + timeout_ms;
+      let prev = "";
+      let stable_polls = 0;
+      while (Date.now() < deadline) {
+        let cur = "";
+        try { cur = await (await import("./uiautomator2.js")).dumpSource(); } catch { cur = ""; }
+        if (cur && cur === prev) {
+          stable_polls++;
+          if (stable_polls >= 1) {
+            return text(`stable`);
+          }
+        } else {
+          stable_polls = 0;
+        }
+        prev = cur;
+        await new Promise((r) => setTimeout(r, poll_ms));
+      }
+      return text(`timeout`);
+    },
   },
   {
     name: "open_notifications",

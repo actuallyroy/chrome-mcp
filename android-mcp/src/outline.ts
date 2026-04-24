@@ -12,6 +12,17 @@ export type Node = {
 
 // --- XML parser ---------------------------------------------------------
 
+function decodeXmlEntities(s: string): string {
+  return s
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCodePoint(Number(n)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, n) => String.fromCodePoint(parseInt(n, 16)));
+}
+
 function parseXml(xml: string): Node | null {
   // Strip prolog, comments, CDATA.
   let s = xml.replace(/<\?xml[^?]*\?>/g, "").replace(/<!--[\s\S]*?-->/g, "");
@@ -30,7 +41,7 @@ function parseXml(xml: string): Node | null {
     const attrs: Record<string, string> = {};
     const attrRe = /([a-zA-Z_][\w.\-:]*)\s*=\s*"([^"]*)"/g;
     let a: RegExpExecArray | null;
-    while ((a = attrRe.exec(attrStr))) attrs[a[1]] = a[2];
+    while ((a = attrRe.exec(attrStr))) attrs[a[1]] = decodeXmlEntities(a[2]);
     const node: Node = { tag: name, attrs, children: [] };
     if (!root) root = node;
     if (stack.length > 0) stack[stack.length - 1].children.push(node);

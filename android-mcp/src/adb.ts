@@ -80,3 +80,20 @@ export function adbSpawn(args: string[]): ChildProcess {
   const bin = findAdb();
   return spawn(bin, [...baseArgs(), ...args], { stdio: ["ignore", "pipe", "pipe"] });
 }
+
+// Cached screen size from `adb shell wm size`. Avoid calling the v9-incompatible
+// /window/rect endpoint.
+let cachedSize: { w: number; h: number } | null = null;
+
+export async function screenSize(): Promise<{ w: number; h: number }> {
+  if (cachedSize) return cachedSize;
+  try {
+    const out = await adbShell("wm size");
+    const m = out.match(/(\d+)x(\d+)/);
+    if (m) {
+      cachedSize = { w: Number(m[1]), h: Number(m[2]) };
+      return cachedSize;
+    }
+  } catch { /* fall through */ }
+  return { w: 1080, h: 2400 };
+}
