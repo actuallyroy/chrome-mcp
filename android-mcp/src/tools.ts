@@ -282,9 +282,7 @@ export const tools: Tool[] = [
     }),
     handler: async (args) => {
       const a = args as { x1: number; y1: number; x2: number; y2: number; duration_ms: number };
-      await u2("POST", "/appium/device/swipe", {
-        startX: a.x1, startY: a.y1, endX: a.x2, endY: a.y2, steps: Math.max(3, Math.round(a.duration_ms / 20)),
-      });
+      await adbShell(`input swipe ${Math.round(a.x1)} ${Math.round(a.y1)} ${Math.round(a.x2)} ${Math.round(a.y2)} ${a.duration_ms}`);
       return text(`swiped (${a.x1},${a.y1}) → (${a.x2},${a.y2})`);
     },
   },
@@ -302,35 +300,30 @@ export const tools: Tool[] = [
         until_text?: string;
         max_steps: number;
       };
-      if (until_text) {
-        // UiScrollable. Works across most scrollable containers.
-        const esc = until_text.replace(/"/g, '\\"');
-        await u2(
-          "POST",
-          "/appium/device/swipe",
-          {},
-        ).catch(() => {});
-        // Use UiSelector scrolling trick.
-        const script = `new UiScrollable(new UiSelector().scrollable(true)).scrollIntoView(new UiSelector().textContains("${esc}"))`;
-        try {
-          await u2("POST", "/element", { using: "-android uiautomator", value: script });
-          return text(`scrolled until visible: "${until_text}"`);
-        } catch (e) {
-          throw new Error(`scroll until "${until_text}" failed: ${(e as Error).message}`);
-        }
-      }
       const { w, h } = await screenSize();
-      const mx = w / 2;
-      const my = h / 2;
+      const mx = Math.round(w / 2);
+      const my = Math.round(h / 2);
+      const [x1, y1, x2, y2] =
+        direction === "down" ? [mx, Math.round(h * 0.75), mx, Math.round(h * 0.25)]
+        : direction === "up" ? [mx, Math.round(h * 0.25), mx, Math.round(h * 0.75)]
+        : direction === "left" ? [Math.round(w * 0.75), my, Math.round(w * 0.25), my]
+        : [Math.round(w * 0.25), my, Math.round(w * 0.75), my];
+      if (until_text) {
+        // Text-search scroll: swipe up to max_steps times, outline after each,
+        // stop as soon as `until_text` appears.
+        const { dumpSource } = await import("./uiautomator2.js");
+        for (let i = 0; i < max_steps; i++) {
+          const xml = await dumpSource().catch(() => "");
+          if (xml.includes(until_text)) return text(`scrolled until visible: "${until_text}" (step ${i})`);
+          await adbShell(`input swipe ${x1} ${y1} ${x2} ${y2} 400`);
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        const xml = await dumpSource().catch(() => "");
+        if (xml.includes(until_text)) return text(`scrolled until visible: "${until_text}" (step ${max_steps})`);
+        throw new Error(`scroll until "${until_text}" not found after ${max_steps} steps`);
+      }
       for (let i = 0; i < max_steps; i++) {
-        const [x1, y1, x2, y2] =
-          direction === "down" ? [mx, h * 0.7, mx, h * 0.3]
-          : direction === "up" ? [mx, h * 0.3, mx, h * 0.7]
-          : direction === "left" ? [w * 0.7, my, w * 0.3, my]
-          : [w * 0.3, my, w * 0.7, my];
-        await u2("POST", "/appium/device/swipe", {
-          startX: x1, startY: y1, endX: x2, endY: y2, steps: 20,
-        });
+        await adbShell(`input swipe ${x1} ${y1} ${x2} ${y2} 300`);
       }
       return text(`scrolled ${direction} x${max_steps}`);
     },
