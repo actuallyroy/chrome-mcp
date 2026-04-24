@@ -272,14 +272,26 @@ const DEV_BADGE_SIGNALS = [
   "[NOTIFICATION",
   "[StartDay]",
   "[StoreDetailsScreen]",
+  "StoreService",
+  "getProductsUnified",
+  "Encountered two children",
+  "Warning:",
   "unhandled promise rejection",
   "Possible unhandled",
   "Failed to send",
+  "Failed to fetch",
   "AxiosError",
   "Network Error",
+  "Non-serializable values",
   "❌",
   "⚠️",
 ];
+
+// A content-desc starting with "!," or a digit+comma followed by a space is a
+// strong structural signal of a LogBox-style badge regardless of the message body.
+function looksLikeBadgeDesc(desc: string): boolean {
+  return /^(?:!|⚠️|❌|\d+)\s*,\s/.test(desc);
+}
 
 type XmlNode = {
   attrs: Record<string, string>;
@@ -347,9 +359,25 @@ async function tap(x: number, y: number) {
 export async function dismissDevOverlay(): Promise<{
   full_screen: boolean;
   badges_dismissed: number;
+  anr_dismissed?: boolean;
 }> {
   try {
-    const xml = await dumpSource();
+    // First: if we're staring at an Android ANR dialog ("X isn't responding"),
+    // tap Wait. This is a `package="android"` system dialog, so we detect it
+    // by its characteristic button ids via XPath on the /source XML.
+    const xmlInitial = await dumpSource();
+    if (/id\/aerr_wait/.test(xmlInitial)) {
+      try {
+        const elId = await findElement("id", "android:id/aerr_wait");
+        await clickElement(elId);
+        await new Promise((r) => setTimeout(r, 500));
+      } catch { /* noop */ }
+      // Re-dump since dialog dismissed; continue to process any other overlays
+      // on the now-visible screen.
+      return { ...(await dismissDevOverlay()), anr_dismissed: true };
+    }
+
+    const xml = xmlInitial;
     const root = parseXmlLite(xml);
     if (!root) return { full_screen: false, badges_dismissed: 0 };
 
@@ -363,7 +391,12 @@ export async function dismissDevOverlay(): Promise<{
       if (desc === "Minimize") hasMinimize = true;
       if (desc === "Dismiss") hasDismiss = true;
       const b = parseBounds(n.attrs.bounds || "");
-      if (b && desc && DEV_BADGE_SIGNALS.some((sig) => desc.includes(sig))) {
+      if (
+        b &&
+        desc &&
+        b.t >= 1800 && // Badges are pinned near the bottom; avoid false positives mid-screen.
+        (DEV_BADGE_SIGNALS.some((sig) => desc.includes(sig)) || looksLikeBadgeDesc(desc))
+      ) {
         matches.push({ desc, bounds: b });
       }
       for (const c of n.children) walk(c);
