@@ -1,0 +1,24 @@
+{
+  "name": "android-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that drives Android devices via UIAutomator2 (chrome-mcp pattern)",
+  "type": "module",
+  "bin": {
+    "android-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.23.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}

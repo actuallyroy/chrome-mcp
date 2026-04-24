@@ -1,8 +1,8 @@
-# chrome-mcp
+# chrome-mcp + android-mcp
 
-An MCP server that drives your **real** Chrome browser — your profile, your logins, your extensions. It attaches over the Chrome DevTools Protocol (CDP); it does not launch Chromium.
+Two MCP servers that drive your **real** tooling from Claude Code — Chrome (via CDP) and Android devices (via UIAutomator2). Same architecture, same distribution: semantic locators, live pause/inject, flow record/replay, one-line install.
 
-Distributed via [chrome-mcp.actuallyroy.com](https://chrome-mcp.actuallyroy.com). The site hosts the bundled server + a tiny loader that handles install, updates, and SHA-256 tamper detection.
+Distributed via [chrome-mcp.actuallyroy.com](https://chrome-mcp.actuallyroy.com). The site hosts both bundled servers + tiny zero-dep loaders that handle install, updates, and SHA-256 tamper detection.
 
 ## For users
 
@@ -68,24 +68,73 @@ See [`examples/demo.flow.json`](./examples/demo.flow.json) for a sample `run_scr
 
 ```
 .
-├── app/                   # Next.js landing page + /api/version
-├── loader/loader.mjs      # zero-dep Node loader shipped to users
-├── installer/             # install.sh, install.ps1
-├── mcp-server/            # the actual MCP server (TypeScript)
+├── app/                       # Next.js landing page + /api/version
+├── loader/
+│   ├── loader.mjs             # chrome-mcp loader (zero-dep)
+│   ├── bootstrap.js           # chrome inline bootstrap for .mcp.json
+│   ├── android-loader.mjs     # android-mcp loader (zero-dep)
+│   └── android-bootstrap.js   # android inline bootstrap
+├── installer/                 # install.sh / install.ps1 (chrome power-user)
+├── mcp-server/                # chrome-mcp TypeScript source
 │   ├── src/
 │   └── package.json
+├── android-mcp/               # android-mcp TypeScript source
+│   ├── src/
+│   │   ├── adb.ts             # adb subprocess wrapper
+│   │   ├── devices.ts
+│   │   ├── uiautomator2.ts    # JSON-RPC client + APK install
+│   │   ├── outline.ts         # view-hierarchy → text outline + stable refs
+│   │   ├── locators.ts        # text/desc/id/xpath/ref resolvers
+│   │   ├── logcat.ts          # ring-buffered logcat capture
+│   │   ├── tools.ts
+│   │   ├── recorder.ts        # copied from mcp-server/
+│   │   └── index.ts
+│   └── package.json
 ├── scripts/
-│   ├── build-mcp.mjs      # builds + bundles MCP, writes manifest, copies assets to public/
+│   ├── build-mcp.mjs          # builds chrome bundle + manifest
+│   ├── build-android-mcp.mjs  # builds android bundle + manifest + fetches UIAutomator2 APKs
 │   ├── launch-chrome.sh
 │   └── launch-chrome.ps1
 ├── examples/
-└── public/                # (gitignored; populated on build)
-    ├── bundle/v<version>.mjs
+└── public/                    # (gitignored; populated on build)
+    ├── bundle/v<version>.mjs             # chrome
     ├── bundle/manifest.json
-    ├── loader.mjs
-    ├── install.sh / install.ps1
-    └── scripts/launch-chrome.{sh,ps1}
+    ├── loader.mjs                        # chrome loader
+    ├── bootstrap.min.js
+    ├── android/bundle/v<version>.mjs
+    ├── android/bundle/manifest.json
+    ├── android/loader.mjs
+    ├── android/bootstrap.min.js
+    ├── android/vendor/uiautomator2-server.apk
+    └── android/vendor/uiautomator2-server-test.apk
 ```
+
+### android-mcp quick reference
+
+Users must have `adb` on PATH or set `ANDROID_MCP_ADB` / `$ANDROID_SDK_ROOT`. Devices listed by `adb devices` are detected automatically; multiple devices require `select_device` first.
+
+On first tool call, the MCP:
+1. Ensures exactly one device is active (or throws).
+2. Checks that `io.appium.uiautomator2.server` + its test APK are installed; if not, downloads from the Vercel endpoint and `adb install -r`s them.
+3. `adb forward tcp:6790 tcp:6790`.
+4. Starts the UIAutomator2 test runner (`am instrument …`), polls `/wd/hub/status` until ready.
+5. Creates a session, caches the id for the process lifetime.
+
+Set `ANDROID_MCP_APK_LOCAL=/abs/path/to.apk` to use a hand-placed APK instead of downloading.
+
+### Known issue: "UiAutomation not connected"
+
+On some emulator AVD configurations (especially Play Store images, or anything that blocks `AccessibilityService` by policy), the Appium UIAutomator2 server reports `IllegalStateException: UiAutomation not connected, UiAutomation@…[id=-1, ...]` on session creation. The APK installs, the HTTP server starts on :6790, but the AccessibilityService handshake never completes. Workarounds:
+
+- Use a **Google APIs** (non-Play Store) system image for the AVD; accessibility service hookup is permissive on those.
+- Or: enable the server as an accessibility service explicitly:
+  ```bash
+  adb shell settings put secure enabled_accessibility_services io.appium.uiautomator2.server.test/androidx.test.runner.AndroidJUnitRunner
+  adb shell settings put secure accessibility_enabled 1
+  ```
+- Or: swap the driver to [openatx/uiautomator2-server](https://github.com/openatx/uiautomator2) — its init path doesn't require AccessibilityService and is generally more emulator-friendly. This requires changing the APK references in `android-mcp/src/uiautomator2.ts` (see issue #34 in project notes).
+
+Everything up to the session handshake (ADB, APK install, instrumentation, HTTP ready) is validated; this is purely an Android-side accessibility-policy issue on certain devices.
 
 ### Build
 

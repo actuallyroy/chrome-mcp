@@ -42,6 +42,20 @@ h2 {
   margin: 40px 0 12px;
   letter-spacing: -0.005em;
 }
+h3 {
+  font-size: 14px;
+  margin: 16px 0 8px;
+  color: var(--muted);
+  font-weight: 500;
+}
+section {
+  padding: 20px;
+  margin: 20px 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(22, 27, 34, 0.35);
+}
+section h2 { margin-top: 0; }
 
 p { margin: 0 0 12px; }
 ul { padding-left: 22px; margin: 0 0 12px; }

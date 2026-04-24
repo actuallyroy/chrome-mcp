@@ -5,7 +5,8 @@
   "description": "Landing page + distribution for chrome-mcp",
   "scripts": {
     "build:mcp": "node scripts/build-mcp.mjs",
-    "prebuild": "npm run build:mcp",
+    "build:android": "node scripts/build-android-mcp.mjs",
+    "prebuild": "npm run build:mcp && npm run build:android",
     "build": "next build",
     "dev": "next dev",
     "start": "next start",

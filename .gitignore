@@ -10,9 +10,14 @@ out
 package-lock.json
 mcp-server/package-lock.json
 
-# Bundle outputs — regenerated on each build by scripts/build-mcp.mjs.
+# Bundle outputs — regenerated on each build.
 public/bundle/
 public/loader.mjs
 public/install.sh
 public/install.ps1
 public/scripts/
+public/android/bundle/
+public/android/vendor/
+public/bootstrap.min.js
+android-mcp/dist/
+android-mcp/package-lock.json
