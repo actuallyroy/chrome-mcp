@@ -6,44 +6,35 @@ Distributed via [chrome-mcp.actuallyroy.com](https://chrome-mcp.actuallyroy.com)
 
 ## For users
 
-### Install
-
-**macOS / Linux**
-```
-curl -fsSL https://chrome-mcp.actuallyroy.com/install.sh | sh
-```
-
-**Windows** (PowerShell)
-```
-irm https://chrome-mcp.actuallyroy.com/install.ps1 | iex
-```
-
-This drops a zero-dep Node loader + a bin shim under `~/.chrome-mcp/`. Requires Node ≥18.
-
-### Launch Chrome with remote debugging
-
-```
-~/.chrome-mcp/bin/chrome-mcp-launch-chrome            # macOS / Linux
-%USERPROFILE%\.chrome-mcp\bin\chrome-mcp-launch-chrome  # Windows
-```
-
-Uses a dedicated profile (`~/ChromeMCP-Profile`). Can run alongside your normal Chrome. Your logins persist across runs.
-
-### Wire up Claude Code
-
-Add to `~/.claude.json` (or project-local `.mcp.json`), then restart Claude Code:
+**One step.** Paste into `~/.claude.json` (or `.mcp.json` in your project) and restart Claude Code. The exact block is on the [landing page](https://chrome-mcp.actuallyroy.com) with the correct bootstrap inlined. In shape:
 
 ```json
 {
   "mcpServers": {
     "chrome": {
-      "command": "~/.chrome-mcp/bin/chrome-mcp"
+      "command": "node",
+      "args": ["-e", "<short bootstrap that fetches loader.mjs on first run>"]
     }
   }
 }
 ```
 
-Windows: `%USERPROFILE%\\.chrome-mcp\\bin\\chrome-mcp.cmd`.
+Requires Node ≥18.
+
+**What happens:**
+1. First launch: bootstrap downloads `~/.chrome-mcp/loader.mjs`, loader fetches the latest bundle, verifies its SHA-256, caches it, executes it.
+2. First tool call: MCP tries to connect to `localhost:9222` — not there? It spawns Chrome with `--remote-debugging-port=9222` on a dedicated profile at `~/ChromeMCP-Profile`. A Chrome window pops up.
+3. You sign into whatever sites once. The profile persists.
+4. Subsequent runs: Chrome is already up, bundle is cached, tools just work.
+
+The dedicated profile coexists with your normal Chrome — we never touch your main profile.
+
+**Power-user install** (skips the bootstrap, writes the loader directly):
+```bash
+curl -fsSL https://chrome-mcp.actuallyroy.com/install.sh | sh      # macOS / Linux
+irm https://chrome-mcp.actuallyroy.com/install.ps1 | iex           # Windows
+```
+This gives you `~/.chrome-mcp/bin/chrome-mcp` as a persistent binary you can reference directly in `.mcp.json` instead of the `node -e` form. Only reason to prefer this: faster cold start (skips the bootstrap's fetch check).
 
 ### Updates
 
