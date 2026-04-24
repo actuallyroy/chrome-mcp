@@ -9,6 +9,7 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 import { tools } from "./tools.js";
 import { recordCall } from "./recorder.js";
 import { dismissDevOverlay } from "./uiautomator2.js";
+import { fingerprint } from "./outline.js";
 
 // Tools that skip auto-dismiss: the dismiss itself (would recurse), and the
 // "pure read / non-interactive" tools where speed matters more than overlay
@@ -49,15 +50,40 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     "click", "fill", "press_key", "long_press", "swipe", "scroll",
     "launch_app", "stop_app", "install_app", "clear_app_data",
   ]);
+  // Tools where an unchanged screen is actively suspicious (a nav attempt that
+  // accomplished nothing). For these, the absence of change is flagged louder.
+  const NAV_EXPECTED = new Set<string>([
+    "press_key", "launch_app", "stop_app",
+  ]);
   if (!SKIP_AUTO_DISMISS.has(tool.name)) {
     try { await dismissDevOverlay(); } catch { /* best-effort */ }
   }
   try {
     const args = tool.schema.parse(rawArgs);
+    const before = INTERACTIVE_TOOLS.has(tool.name)
+      ? await fingerprint().catch(() => "")
+      : "";
     const result = await tool.handler(args as Record<string, unknown>);
     if (INTERACTIVE_TOOLS.has(tool.name)) {
       // Dev overlays spawned by this action can still block the next call.
       try { await dismissDevOverlay(); } catch { /* best-effort */ }
+      // Give the UI a tiny beat to settle before sampling.
+      await new Promise((r) => setTimeout(r, 150));
+      const after = await fingerprint().catch(() => "");
+      if (before && after) {
+        const changed = before !== after;
+        const navHint =
+          !changed && NAV_EXPECTED.has(tool.name)
+            ? " — expected navigation did not happen (modal, root screen, or blocked?)"
+            : "";
+        const note = `[screen_changed: ${changed}]${navHint}`;
+        const firstText = result.content.find((c) => c.type === "text");
+        if (firstText && typeof firstText.text === "string") {
+          firstText.text = `${firstText.text}\n${note}`;
+        } else {
+          result.content.push({ type: "text", text: note });
+        }
+      }
     }
     const preview = result.content.find((c) => c.type === "text")?.text;
     recordCall(tool.name, args, !result.isError, preview);

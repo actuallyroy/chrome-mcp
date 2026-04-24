@@ -1,4 +1,5 @@
 import { readFileSync, unlinkSync } from "node:fs";
+import { PNG } from "pngjs";
 import { z } from "zod";
 import { adb, adbShell, screenSize } from "./adb.js";
 import {
@@ -33,6 +34,31 @@ export type ToolResult = {
 
 const text = (s: string): ToolResult => ({ content: [{ type: "text", text: s }] });
 const json = (o: unknown): ToolResult => text(JSON.stringify(o, null, 2));
+
+// Nearest-neighbor PNG downscale so the longest side is <= maxDim. Returns
+// base64. If the image is already small enough, returns the input unchanged.
+function resizePngBase64(b64: string, maxDim: number): string {
+  const src = PNG.sync.read(Buffer.from(b64, "base64"));
+  const longest = Math.max(src.width, src.height);
+  if (longest <= maxDim) return b64;
+  const scale = maxDim / longest;
+  const dw = Math.max(1, Math.round(src.width * scale));
+  const dh = Math.max(1, Math.round(src.height * scale));
+  const dst = new PNG({ width: dw, height: dh });
+  for (let y = 0; y < dh; y++) {
+    const sy = Math.min(src.height - 1, Math.floor(y / scale));
+    for (let x = 0; x < dw; x++) {
+      const sx = Math.min(src.width - 1, Math.floor(x / scale));
+      const si = (sy * src.width + sx) << 2;
+      const di = (y * dw + x) << 2;
+      dst.data[di] = src.data[si];
+      dst.data[di + 1] = src.data[si + 1];
+      dst.data[di + 2] = src.data[si + 2];
+      dst.data[di + 3] = src.data[si + 3];
+    }
+  }
+  return PNG.sync.write(dst).toString("base64");
+}
 
 export type Tool = {
   name: string;
@@ -166,11 +192,16 @@ export const tools: Tool[] = [
   },
   {
     name: "screenshot",
-    description: "PNG screenshot of the current device screen (base64).",
-    schema: z.object({}),
-    handler: async () => {
+    description:
+      "PNG screenshot of the current device screen (base64). Automatically downscaled so the longest side is ≤1600px (MCP image limit is 2000px).",
+    schema: z.object({
+      max_dim: z.number().int().min(256).max(2000).default(1600),
+    }),
+    handler: async (args) => {
+      const { max_dim } = args as { max_dim: number };
       const b64 = await u2Screenshot();
-      return { content: [{ type: "image", data: b64, mimeType: "image/png" }] };
+      const resized = resizePngBase64(b64, max_dim);
+      return { content: [{ type: "image", data: resized, mimeType: "image/png" }] };
     },
   },
 

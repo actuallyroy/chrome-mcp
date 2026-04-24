@@ -180,3 +180,31 @@ export async function outline(): Promise<string> {
 export function getTree(): Promise<Node | null> {
   return dumpSource().then(parseXml);
 }
+
+// Cheap screen fingerprint — captures package + activity + structural shape
+// (class names and bounds of every element). Changes when navigation, modal,
+// or any meaningful re-render happens.
+export async function fingerprint(): Promise<string> {
+  const xml = await dumpSource().catch(() => "");
+  if (!xml) return "";
+  const root = parseXml(xml);
+  if (!root) return "";
+  const parts: string[] = [];
+  const pkg = root.attrs.package || root.children[0]?.attrs.package || "";
+  parts.push(pkg);
+  function walk(n: Node) {
+    if (n.attrs.bounds || n.attrs.class) {
+      parts.push(`${n.attrs.class || ""}@${n.attrs.bounds || ""}`);
+    }
+    for (const c of n.children) walk(c);
+  }
+  walk(root);
+  const joined = parts.join("|");
+  // Light hash: FNV-1a 32-bit is enough for equality testing.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < joined.length; i++) {
+    h ^= joined.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(16);
+}
