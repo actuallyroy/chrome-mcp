@@ -105,4 +105,20 @@ for (const { from, to } of copies) {
   }
 }
 console.log("copied loader, installers, and launch scripts to public/");
+
+// 6. Minify the bootstrap snippet (used inline in .mcp.json via `node -e`).
+const bootstrapSrc = readFileSync(join(ROOT, "loader", "bootstrap.js"), "utf8");
+const minResult = await esbuild({
+  stdin: { contents: bootstrapSrc, loader: "js" },
+  bundle: false,
+  minify: true,
+  format: "esm",
+  target: "node18",
+  write: false,
+  logLevel: "silent",
+});
+const bootstrapMin = minResult.outputFiles[0].text.trim().replace(/\n+$/, "");
+writeFileSync(join(PUBLIC_DIR, "bootstrap.min.js"), bootstrapMin, "utf8");
+console.log(`bootstrap: ${bootstrapMin.length} chars`);
+
 console.log("build-mcp: done.");

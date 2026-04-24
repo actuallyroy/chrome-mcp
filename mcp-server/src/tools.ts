@@ -3,6 +3,7 @@ import type { ElementHandle, Page } from "puppeteer-core";
 import {
   getActivePage,
   getBrowser,
+  launchChrome,
   listPages,
   selectPageByIndex,
   selectPageByUrlSubstring,
@@ -494,6 +495,19 @@ export const tools: Tool[] = [
         await p.waitForNavigation({ waitUntil: wait_until, timeout: timeout_ms });
         return text(`At ${p.url()}`);
       }),
+  },
+
+  // ---- Chrome lifecycle --------------------------------------------------
+  {
+    name: "launch_chrome",
+    description:
+      "Explicitly launch Chrome with remote debugging enabled, using a dedicated profile at ~/ChromeMCP-Profile. Normally not needed — the first tool call auto-spawns Chrome if the debug port isn't up. First run creates an empty profile; sign into the sites you want to drive, and the session persists.",
+    schema: z.object({ headless: z.boolean().default(false) }),
+    handler: async (args) => {
+      const { headless } = args as { headless: boolean };
+      const r = await launchChrome({ headless });
+      return json(r);
+    },
   },
 
   // ---- Tab control -------------------------------------------------------

@@ -1,3 +1,7 @@
+import { spawn } from "node:child_process";
+import { existsSync, mkdirSync } from "node:fs";
+import { homedir, platform } from "node:os";
+import { join } from "node:path";
 import puppeteer, { Browser, Page } from "puppeteer-core";
 import { INSTRUMENTATION_SCRIPT } from "./instrumentation.js";
 
@@ -6,6 +10,99 @@ const DEFAULT_HOST = process.env.CHROME_DEBUG_HOST ?? "127.0.0.1";
 
 let browser: Browser | null = null;
 let activePage: Page | null = null;
+
+function findChromeBinary(): string | null {
+  if (process.env.CHROME_BIN && existsSync(process.env.CHROME_BIN)) {
+    return process.env.CHROME_BIN;
+  }
+  const candidates: string[] =
+    platform() === "darwin"
+      ? [
+          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+          "/Applications/Google Chrome Beta.app/Contents/MacOS/Google Chrome Beta",
+          "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+        ]
+      : platform() === "win32"
+        ? [
+            join(process.env["ProgramFiles"] || "C:\\Program Files", "Google\\Chrome\\Application\\chrome.exe"),
+            join(
+              process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)",
+              "Google\\Chrome\\Application\\chrome.exe",
+            ),
+            join(process.env.LOCALAPPDATA || "", "Google\\Chrome\\Application\\chrome.exe"),
+          ]
+        : [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/snap/bin/chromium",
+          ];
+  return candidates.find((p) => existsSync(p)) || null;
+}
+
+async function isDebugPortUp(): Promise<boolean> {
+  try {
+    const res = await fetch(`http://${DEFAULT_HOST}:${DEFAULT_PORT}/json/version`, {
+      signal: AbortSignal.timeout(500),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+export async function launchChrome(opts: { headless?: boolean } = {}): Promise<{
+  launched: boolean;
+  port: number;
+  profile: string;
+  message: string;
+}> {
+  const profile =
+    process.env.CHROME_USER_DATA_DIR || join(homedir(), "ChromeMCP-Profile");
+  if (await isDebugPortUp()) {
+    return {
+      launched: false,
+      port: DEFAULT_PORT,
+      profile,
+      message: `Chrome already listening on :${DEFAULT_PORT}`,
+    };
+  }
+  const bin = findChromeBinary();
+  if (!bin) {
+    throw new Error(
+      "Could not find Chrome. Set CHROME_BIN to the absolute path of your Chrome executable.",
+    );
+  }
+  mkdirSync(profile, { recursive: true });
+  const args = [
+    `--remote-debugging-port=${DEFAULT_PORT}`,
+    `--user-data-dir=${profile}`,
+  ];
+  if (opts.headless) args.push("--headless=new");
+  const child = spawn(bin, args, {
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+
+  // Wait up to ~10s for the debug port to respond.
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    if (await isDebugPortUp()) {
+      return {
+        launched: true,
+        port: DEFAULT_PORT,
+        profile,
+        message: `Launched Chrome (pid ${child.pid}) with profile ${profile}`,
+      };
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  throw new Error(
+    `Spawned Chrome (pid ${child.pid}) but port ${DEFAULT_PORT} didn't come up within 10s.`,
+  );
+}
 
 async function attachInstrumentation(page: Page) {
   // Re-install on every new document so refs/toast watcher survive navigations.
@@ -29,18 +126,28 @@ export async function getBrowser(): Promise<Browser> {
   if (browser && browser.connected) return browser;
 
   const browserURL = `http://${DEFAULT_HOST}:${DEFAULT_PORT}`;
+  const autoSpawn = !/^(1|true|yes)$/i.test(process.env.CHROME_MCP_NO_AUTOSPAWN || "");
   try {
-    browser = await puppeteer.connect({
-      browserURL,
-      defaultViewport: null,
-    });
-  } catch (err) {
-    throw new Error(
-      `Could not connect to Chrome at ${browserURL}. ` +
-        `Make sure Chrome was launched with --remote-debugging-port=${DEFAULT_PORT}. ` +
-        `Run: npm run launch-chrome\n` +
-        `Underlying error: ${(err as Error).message}`,
-    );
+    browser = await puppeteer.connect({ browserURL, defaultViewport: null });
+  } catch (firstErr) {
+    if (!autoSpawn) {
+      throw new Error(
+        `Could not connect to Chrome at ${browserURL}. ` +
+          `Launch it with --remote-debugging-port=${DEFAULT_PORT} or unset CHROME_MCP_NO_AUTOSPAWN.\n` +
+          `Underlying error: ${(firstErr as Error).message}`,
+      );
+    }
+    try {
+      // eslint-disable-next-line no-console
+      console.error("[chrome-mcp] debug port not up — spawning Chrome…");
+      await launchChrome();
+      browser = await puppeteer.connect({ browserURL, defaultViewport: null });
+    } catch (err) {
+      throw new Error(
+        `Auto-launch failed. ${(err as Error).message}\n` +
+          `You can launch Chrome manually and set CHROME_MCP_NO_AUTOSPAWN=1 to skip this path.`,
+      );
+    }
   }
   browser.on("disconnected", () => {
     browser = null;
