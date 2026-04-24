@@ -40,7 +40,7 @@ function run(cmd, cwd) {
 
 // 1. Compile MCP TypeScript (catches type errors; esbuild alone doesn't typecheck).
 if (!existsSync(join(MCP_DIR, "node_modules"))) {
-  run("npm install --no-audit --no-fund", MCP_DIR);
+  run("npm install --include=dev --no-audit --no-fund", MCP_DIR);
 }
 run("npx tsc", MCP_DIR);
 
