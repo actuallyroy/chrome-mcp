@@ -8,6 +8,7 @@ import {
   selectPageByUrlSubstring,
   setActivePage,
 } from "./browser.js";
+import { readFileSync } from "node:fs";
 import {
   recorderStatus,
   startRecording,
@@ -786,5 +787,151 @@ export const tools: Tool[] = [
     description: "Return whether flow recording is active and how many entries have been captured.",
     schema: z.object({}),
     handler: async () => json(recorderStatus()),
+  },
+
+  // ---- Assertions --------------------------------------------------------
+  {
+    name: "assert",
+    description:
+      "Assert a condition on the current page. Throws on failure (useful as a script step). Provide one of: url_contains, text_visible, toast (substring), element (locator shape, passes if exists+visible).",
+    schema: z.object({
+      url_contains: z.string().optional(),
+      text_visible: z.string().optional(),
+      toast: z.string().optional(),
+      element: z
+        .object({
+          ref: z.number().int().optional(),
+          text: z.string().optional(),
+          label: z.string().optional(),
+          selector: z.string().optional(),
+        })
+        .optional(),
+    }),
+    handler: async (args) =>
+      withPage(async (p) => {
+        const a = args as {
+          url_contains?: string;
+          text_visible?: string;
+          toast?: string;
+          element?: LocatorArgs;
+        };
+        if (a.url_contains) {
+          const url = p.url();
+          if (!url.includes(a.url_contains))
+            throw new Error(`assert.url_contains failed: "${a.url_contains}" not in ${url}`);
+          return text(`ok (url contains "${a.url_contains}")`);
+        }
+        if (a.text_visible) {
+          const ok = await p.evaluate((needle: string) => {
+            return document.body.innerText.includes(needle);
+          }, a.text_visible);
+          if (!ok) throw new Error(`assert.text_visible failed: "${a.text_visible}" not on page`);
+          return text(`ok (text visible)`);
+        }
+        if (a.toast) {
+          const hit = await p.evaluate((needle: string) => {
+            const w = window as unknown as { __mcp: { toasts: { text: string }[] } };
+            const q = needle.toLowerCase();
+            return w.__mcp.toasts.find((x) => x.text.toLowerCase().includes(q)) || null;
+          }, a.toast);
+          if (!hit) throw new Error(`assert.toast failed: no toast containing "${a.toast}"`);
+          return text(`ok (toast seen)`);
+        }
+        if (a.element) {
+          await resolveLocator(p, a.element); // throws if not found
+          return text(`ok (element present)`);
+        }
+        throw new Error("assert: provide one of url_contains / text_visible / toast / element");
+      }),
+  },
+
+  // ---- Script runner -----------------------------------------------------
+  {
+    name: "run_script",
+    description:
+      "Execute a JSON flow script. Accepts either `path` (absolute) or inline `script`. Script shape: either the recorder output `{entries: [{tool, args}]}` OR `{steps: [{tool, args}]}`. Extra step fields: `name` (label for logs), `skip` (boolean), `on_error` ('continue'|'stop', default 'stop'). Returns a per-step pass/fail report.",
+    schema: z.object({
+      path: z.string().optional(),
+      script: z
+        .object({
+          steps: z.array(z.object({ tool: z.string(), args: z.record(z.any()).optional() })).optional(),
+          entries: z.array(z.object({ tool: z.string(), args: z.record(z.any()).optional() })).optional(),
+        })
+        .optional(),
+      continue_on_error: z.boolean().default(false),
+      dry_run: z.boolean().default(false),
+    }),
+    handler: async (args) => {
+      const { path, script, continue_on_error, dry_run } = args as {
+        path?: string;
+        script?: { steps?: { tool: string; args?: Record<string, unknown> }[]; entries?: { tool: string; args?: Record<string, unknown> }[] };
+        continue_on_error: boolean;
+        dry_run: boolean;
+      };
+      let parsed: { steps?: { tool: string; args?: Record<string, unknown> }[]; entries?: { tool: string; args?: Record<string, unknown> }[] };
+      if (path) {
+        const raw = readFileSync(path, "utf8");
+        parsed = JSON.parse(raw);
+      } else if (script) {
+        parsed = script;
+      } else {
+        throw new Error("run_script: provide either `path` or `script`");
+      }
+      const steps = parsed.steps ?? parsed.entries ?? [];
+      if (steps.length === 0) throw new Error("run_script: no steps/entries in script");
+
+      const report: {
+        i: number;
+        tool: string;
+        ok: boolean;
+        ms: number;
+        result_preview?: string;
+        error?: string;
+      }[] = [];
+
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i] as {
+          tool: string;
+          args?: Record<string, unknown>;
+          skip?: boolean;
+          on_error?: "continue" | "stop";
+          name?: string;
+        };
+        if (step.skip) {
+          report.push({ i, tool: step.tool, ok: true, ms: 0, result_preview: "skipped" });
+          continue;
+        }
+        if (dry_run) {
+          report.push({ i, tool: step.tool, ok: true, ms: 0, result_preview: "(dry run)" });
+          continue;
+        }
+        const tool = tools.find((t) => t.name === step.tool);
+        if (!tool) {
+          const entry = { i, tool: step.tool, ok: false, ms: 0, error: "unknown tool" };
+          report.push(entry);
+          if (continue_on_error || step.on_error === "continue") continue;
+          return json({ ok: false, stopped_at: i, report });
+        }
+        const t0 = Date.now();
+        try {
+          const validated = tool.schema.parse(step.args ?? {});
+          const r = await tool.handler(validated as Record<string, unknown>);
+          const preview = r.content.find((c) => c.type === "text")?.text?.slice(0, 200);
+          if (r.isError) {
+            const entry = { i, tool: step.tool, ok: false, ms: Date.now() - t0, error: preview };
+            report.push(entry);
+            if (continue_on_error || step.on_error === "continue") continue;
+            return json({ ok: false, stopped_at: i, report });
+          }
+          report.push({ i, tool: step.tool, ok: true, ms: Date.now() - t0, result_preview: preview });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          report.push({ i, tool: step.tool, ok: false, ms: Date.now() - t0, error: msg });
+          if (continue_on_error || step.on_error === "continue") continue;
+          return json({ ok: false, stopped_at: i, report });
+        }
+      }
+      return json({ ok: true, steps_run: report.length, report });
+    },
   },
 ];

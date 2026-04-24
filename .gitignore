@@ -1,6 +1,18 @@
 node_modules
+**/node_modules
 dist
+.next
+.vercel
+out
 *.log
 .DS_Store
 .mcp.json
 package-lock.json
+mcp-server/package-lock.json
+
+# Bundle outputs — regenerated on each build by scripts/build-mcp.mjs.
+public/bundle/
+public/loader.mjs
+public/install.sh
+public/install.ps1
+public/scripts/

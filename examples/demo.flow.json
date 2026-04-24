@@ -1,0 +1,44 @@
+{
+  "steps": [
+    {
+      "name": "Open example.com",
+      "tool": "navigate",
+      "args": { "url": "https://example.com/" }
+    },
+    {
+      "name": "Page text is present",
+      "tool": "assert",
+      "args": { "text_visible": "Example Domain" }
+    },
+    {
+      "name": "'Learn more' link exists",
+      "tool": "assert",
+      "args": { "element": { "text": "Learn more" } }
+    },
+    {
+      "name": "This step intentionally fails but is allowed to continue",
+      "tool": "assert",
+      "args": { "element": { "text": "DefinitelyNotOnPage" } },
+      "on_error": "continue"
+    },
+    {
+      "name": "Navigate to a second site",
+      "tool": "navigate",
+      "args": { "url": "https://example.org/" }
+    },
+    {
+      "name": "Confirm landed on example.org",
+      "tool": "assert",
+      "args": { "url_contains": "example.org" }
+    },
+    {
+      "name": "Go back",
+      "tool": "go_back"
+    },
+    {
+      "name": "Verify back on example.com",
+      "tool": "assert",
+      "args": { "url_contains": "example.com" }
+    }
+  ]
+}

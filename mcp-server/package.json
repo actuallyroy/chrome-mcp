@@ -1,0 +1,26 @@
+{
+  "name": "chrome-mcp",
+  "version": "0.2.0",
+  "description": "MCP server that drives your real Chrome browser over CDP",
+  "type": "module",
+  "bin": {
+    "chrome-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "launch-chrome": "./scripts/launch-chrome.sh"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "puppeteer-core": "^23.0.0",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.23.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  }
+}
