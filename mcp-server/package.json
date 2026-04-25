@@ -1,6 +1,6 @@
 {
   "name": "chrome-mcp",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "MCP server that drives your real Chrome browser over CDP",
   "type": "module",
   "bin": {
@@ -15,12 +15,14 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.4",
+    "pngjs": "^7.0.0",
     "puppeteer-core": "^23.0.0",
     "zod": "^3.23.8",
     "zod-to-json-schema": "^3.23.5"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/pngjs": "^6.0.5",
     "typescript": "^5.6.0"
   }
 }

@@ -1,5 +1,29 @@
+import { PNG } from "pngjs";
 import { z } from "zod";
 import type { ElementHandle, Page } from "puppeteer-core";
+
+function resizePngBase64(b64: string, maxDim: number): string {
+  const src = PNG.sync.read(Buffer.from(b64, "base64"));
+  const longest = Math.max(src.width, src.height);
+  if (longest <= maxDim) return b64;
+  const scale = maxDim / longest;
+  const dw = Math.max(1, Math.round(src.width * scale));
+  const dh = Math.max(1, Math.round(src.height * scale));
+  const dst = new PNG({ width: dw, height: dh });
+  for (let y = 0; y < dh; y++) {
+    const sy = Math.min(src.height - 1, Math.floor(y / scale));
+    for (let x = 0; x < dw; x++) {
+      const sx = Math.min(src.width - 1, Math.floor(x / scale));
+      const si = (sy * src.width + sx) << 2;
+      const di = (y * dw + x) << 2;
+      dst.data[di] = src.data[si];
+      dst.data[di + 1] = src.data[si + 1];
+      dst.data[di + 2] = src.data[si + 2];
+      dst.data[di + 3] = src.data[si + 3];
+    }
+  }
+  return PNG.sync.write(dst).toString("base64");
+}
 import {
   getActivePage,
   getBrowser,
@@ -638,13 +662,16 @@ export const tools: Tool[] = [
   {
     name: "screenshot",
     description:
-      "Take a PNG screenshot of the active tab. Set full_page=true for the full scrollable area. Prefer `outline` for navigation and element lookup — it's cheaper, faster, and returns stable refs. Use screenshot only for visual verification, layout bugs, or content the DOM can't describe (canvas, charts, rendered media).",
-    schema: z.object({ full_page: z.boolean().default(false) }),
+      "Take a PNG screenshot of the active tab, auto-downscaled to fit the MCP 2000px image limit. Set full_page=true for the full scrollable area. Prefer `outline` for navigation and element lookup — it's cheaper, faster, and returns stable refs. Use screenshot only for visual verification, layout bugs, or content the DOM can't describe (canvas, charts, rendered media).",
+    schema: z.object({
+      full_page: z.boolean().default(false),
+      max_dim: z.number().int().min(256).max(2000).default(1600),
+    }),
     handler: async (args) =>
       withPage(async (p) => {
-        const { full_page } = args as { full_page: boolean };
+        const { full_page, max_dim } = args as { full_page: boolean; max_dim: number };
         const buf = (await p.screenshot({ fullPage: full_page, type: "png" })) as Uint8Array;
-        const b64 = Buffer.from(buf).toString("base64");
+        const b64 = resizePngBase64(Buffer.from(buf).toString("base64"), max_dim);
         return { content: [{ type: "image", data: b64, mimeType: "image/png" }] };
       }),
   },
