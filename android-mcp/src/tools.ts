@@ -37,6 +37,18 @@ const text = (s: string): ToolResult => ({ content: [{ type: "text", text: s }] 
 const json = (o: unknown): ToolResult => text(JSON.stringify(o, null, 2));
 const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+// Mirror the dispatcher's auto-dismiss policy so run_script steps get the
+// same overlay clearing the top-level calls get.
+const RUN_SCRIPT_INTERACTIVE = new Set<string>([
+  "click", "fill", "press_key", "long_press", "swipe", "scroll",
+  "launch_app", "stop_app", "install_app", "clear_app_data",
+]);
+const RUN_SCRIPT_SKIP_AUTO_DISMISS = new Set<string>([
+  "dismiss_dev_overlay", "list_devices", "select_device", "device_info",
+  "get_logcat", "recording_status", "start_recording", "stop_recording",
+  "send_feedback",
+]);
+
 // Nearest-neighbor PNG downscale so the longest side is <= maxDim. Returns
 // base64. If the image is already small enough, returns the input unchanged.
 function resizePngBase64(b64: string, maxDim: number): string {
@@ -580,10 +592,19 @@ export const tools: Tool[] = [
           if (!continue_on_error && step.on_error !== "continue") return json({ ok: false, stopped_at: i, report });
           continue;
         }
+        // Same wrap-around as the top-level dispatcher: dismiss dev overlays
+        // before/after interactive steps so a popup raised by step N doesn't
+        // block step N+1's locator.
+        if (!RUN_SCRIPT_SKIP_AUTO_DISMISS.has(step.tool)) {
+          try { await dismissDevOverlay(); } catch { /* best-effort */ }
+        }
         const t0 = Date.now();
         try {
           const validated = tool.schema.parse(step.args ?? {});
           const r = await tool.handler(validated as Record<string, unknown>);
+          if (RUN_SCRIPT_INTERACTIVE.has(step.tool)) {
+            try { await dismissDevOverlay(); } catch { /* best-effort */ }
+          }
           const fullText = r.content.find((c) => c.type === "text")?.text;
           const preview = fullText?.slice(0, 200);
           if (r.isError) {
@@ -641,7 +662,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "android",
-          version: "0.1.10",
+          version: "0.1.11",
           context,
         }),
       });
