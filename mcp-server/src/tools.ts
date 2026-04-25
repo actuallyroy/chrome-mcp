@@ -891,7 +891,12 @@ export const tools: Tool[] = [
   {
     name: "run_script",
     description:
-      "Execute a JSON flow script. Accepts either `path` (absolute) or inline `script`. Script shape: either the recorder output `{entries: [{tool, args}]}` OR `{steps: [{tool, args}]}`. Extra step fields: `name` (label for logs), `skip` (boolean), `on_error` ('continue'|'stop', default 'stop'). Returns a per-step pass/fail report.",
+      "Execute a JSON flow of MCP tool calls. Two modes:\n\n" +
+      "(1) **Inline batching** — when you know the next 2-3 steps with confidence, pass them inline to save round-trips:\n" +
+      `  run_script { script: { steps: [{ tool: "click", args: { ref: 7 } }, { tool: "fill", args: { ref: 9, value: "x" } }, { tool: "click", args: { text: "Submit" } }] } }\n` +
+      "  By default it stops at the first failure and the report shows the failing index `i` so you can pivot.\n\n" +
+      "(2) **Saved flow** — pass a `path` to a recorded JSON file. Use `start_at` / `end_at` / `only` to re-run from a checkpoint or hot-fix a single step.\n\n" +
+      "Step shape: {tool, args?, skip?, on_error?}. Set `verbose: true` to get full per-step output instead of 200-char previews (useful when you batched in lieu of separate calls).",
     schema: z.object({
       path: z.string().optional(),
       script: z
@@ -902,13 +907,21 @@ export const tools: Tool[] = [
         .optional(),
       continue_on_error: z.boolean().default(false),
       dry_run: z.boolean().default(false),
+      start_at: z.number().int().min(0).optional().describe("Skip steps before this index."),
+      end_at: z.number().int().min(0).optional().describe("Stop after this index (inclusive)."),
+      only: z.number().int().min(0).optional().describe("Run just this single step. Shorthand for start_at == end_at == only."),
+      verbose: z.boolean().default(false).describe("Return full per-step output instead of 200-char previews."),
     }),
     handler: async (args) => {
-      const { path, script, continue_on_error, dry_run } = args as {
+      const { path, script, continue_on_error, dry_run, start_at, end_at, only, verbose } = args as {
         path?: string;
         script?: { steps?: { tool: string; args?: Record<string, unknown> }[]; entries?: { tool: string; args?: Record<string, unknown> }[] };
         continue_on_error: boolean;
         dry_run: boolean;
+        start_at?: number;
+        end_at?: number;
+        only?: number;
+        verbose: boolean;
       };
       let parsed: { steps?: { tool: string; args?: Record<string, unknown> }[]; entries?: { tool: string; args?: Record<string, unknown> }[] };
       if (path) {
@@ -922,16 +935,22 @@ export const tools: Tool[] = [
       const steps = parsed.steps ?? parsed.entries ?? [];
       if (steps.length === 0) throw new Error("run_script: no steps/entries in script");
 
+      const from = only != null ? only : (start_at ?? 0);
+      const to = only != null ? only : (end_at != null ? end_at : steps.length - 1);
+      if (from < 0 || from >= steps.length) throw new Error(`start index ${from} out of range (0..${steps.length - 1})`);
+      if (to < from || to >= steps.length) throw new Error(`end index ${to} out of range (${from}..${steps.length - 1})`);
+
       const report: {
         i: number;
         tool: string;
         ok: boolean;
         ms: number;
         result_preview?: string;
+        result?: string;
         error?: string;
       }[] = [];
 
-      for (let i = 0; i < steps.length; i++) {
+      for (let i = from; i <= to; i++) {
         const step = steps[i] as {
           tool: string;
           args?: Record<string, unknown>;
@@ -958,14 +977,19 @@ export const tools: Tool[] = [
         try {
           const validated = tool.schema.parse(step.args ?? {});
           const r = await tool.handler(validated as Record<string, unknown>);
-          const preview = r.content.find((c) => c.type === "text")?.text?.slice(0, 200);
+          const fullText = r.content.find((c) => c.type === "text")?.text;
+          const preview = fullText?.slice(0, 200);
           if (r.isError) {
             const entry = { i, tool: step.tool, ok: false, ms: Date.now() - t0, error: preview };
             report.push(entry);
             if (continue_on_error || step.on_error === "continue") continue;
             return json({ ok: false, stopped_at: i, report });
           }
-          report.push({ i, tool: step.tool, ok: true, ms: Date.now() - t0, result_preview: preview });
+          const entry: { i: number; tool: string; ok: boolean; ms: number; result_preview?: string; result?: string } = {
+            i, tool: step.tool, ok: true, ms: Date.now() - t0,
+          };
+          if (verbose) entry.result = fullText; else entry.result_preview = preview;
+          report.push(entry);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           report.push({ i, tool: step.tool, ok: false, ms: Date.now() - t0, error: msg });
@@ -1012,7 +1036,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "chrome",
-          version: "0.2.1",
+          version: "0.2.3",
           context,
         }),
       });
