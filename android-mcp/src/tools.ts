@@ -35,6 +35,7 @@ export type ToolResult = {
 
 const text = (s: string): ToolResult => ({ content: [{ type: "text", text: s }] });
 const json = (o: unknown): ToolResult => text(JSON.stringify(o, null, 2));
+const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 // Nearest-neighbor PNG downscale so the longest side is <= maxDim. Returns
 // base64. If the image is already small enough, returns the input unchanged.
@@ -289,16 +290,21 @@ export const tools: Tool[] = [
   },
   {
     name: "scroll",
-    description: "Scroll in a direction until a text is visible (or just a few steps).",
+    description:
+      "Scroll in a direction. With `until_text`, `until_desc`, or `until_id` populated, swipes up to max_steps times and stops as soon as a matching element becomes visible (substring match against text / content-desc / resource-id in the view hierarchy). Without an `until_*`, just performs max_steps swipes.",
     schema: z.object({
       direction: z.enum(["up", "down", "left", "right"]).default("down"),
-      until_text: z.string().optional(),
+      until_text: z.string().optional().describe("Stop when an element with this visible text appears (substring match)."),
+      until_desc: z.string().optional().describe("Stop when an element with this content-desc / accessibility label appears (substring match)."),
+      until_id: z.string().optional().describe("Stop when an element with this resource-id appears (substring match, e.g. 'com.app:id/checkout')."),
       max_steps: z.number().int().min(1).default(8),
     }),
     handler: async (args) => {
-      const { direction, until_text, max_steps } = args as {
+      const { direction, until_text, until_desc, until_id, max_steps } = args as {
         direction: "up" | "down" | "left" | "right";
         until_text?: string;
+        until_desc?: string;
+        until_id?: string;
         max_steps: number;
       };
       const { w, h } = await screenSize();
@@ -309,19 +315,27 @@ export const tools: Tool[] = [
         : direction === "up" ? [mx, Math.round(h * 0.25), mx, Math.round(h * 0.75)]
         : direction === "left" ? [Math.round(w * 0.75), my, Math.round(w * 0.25), my]
         : [Math.round(w * 0.25), my, Math.round(w * 0.75), my];
-      if (until_text) {
-        // Text-search scroll: swipe up to max_steps times, outline after each,
-        // stop as soon as `until_text` appears.
+
+      const matches = (xml: string): string | null => {
+        if (until_text && new RegExp(`text="[^"]*${escapeRegex(until_text)}`).test(xml)) return `text~="${until_text}"`;
+        if (until_desc && new RegExp(`content-desc="[^"]*${escapeRegex(until_desc)}`).test(xml)) return `desc~="${until_desc}"`;
+        if (until_id && new RegExp(`resource-id="[^"]*${escapeRegex(until_id)}`).test(xml)) return `id~="${until_id}"`;
+        return null;
+      };
+      const hasUntil = !!(until_text || until_desc || until_id);
+      if (hasUntil) {
         const { dumpSource } = await import("./uiautomator2.js");
-        for (let i = 0; i < max_steps; i++) {
+        for (let i = 0; i <= max_steps; i++) {
           const xml = await dumpSource().catch(() => "");
-          if (xml.includes(until_text)) return text(`scrolled until visible: "${until_text}" (step ${i})`);
+          const hit = matches(xml);
+          if (hit) return text(`scrolled until visible: ${hit} (step ${i})`);
+          if (i === max_steps) break;
           await adbShell(`input swipe ${x1} ${y1} ${x2} ${y2} 400`);
           await new Promise((r) => setTimeout(r, 250));
         }
-        const xml = await dumpSource().catch(() => "");
-        if (xml.includes(until_text)) return text(`scrolled until visible: "${until_text}" (step ${max_steps})`);
-        throw new Error(`scroll until "${until_text}" not found after ${max_steps} steps`);
+        const tried = [until_text && `text="${until_text}"`, until_desc && `desc="${until_desc}"`, until_id && `id="${until_id}"`]
+          .filter(Boolean).join(", ");
+        throw new Error(`scroll until ${tried} not found after ${max_steps} steps`);
       }
       for (let i = 0; i < max_steps; i++) {
         await adbShell(`input swipe ${x1} ${y1} ${x2} ${y2} 300`);
@@ -605,7 +619,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "android",
-          version: "0.1.8",
+          version: "0.1.9",
           context,
         }),
       });
