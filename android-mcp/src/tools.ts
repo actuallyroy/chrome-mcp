@@ -195,11 +195,11 @@ export const tools: Tool[] = [
     handler: async (args) => {
       const elId = await resolveElementId(args as LocatorArgs);
       const [rect, text, enabled, displayed, name] = await Promise.all([
-        u2("GET", `/element/${elId}/rect`),
-        u2("GET", `/element/${elId}/text`),
-        u2("GET", `/element/${elId}/enabled`),
-        u2("GET", `/element/${elId}/displayed`),
-        u2("GET", `/element/${elId}/name`).catch(() => null),
+        u2("GET", `/element/${elId}/rect`).catch(() => null),
+        u2("GET", `/element/${elId}/text`).catch(() => null),
+        u2("GET", `/element/${elId}/attribute/enabled`).catch(() => null),
+        u2("GET", `/element/${elId}/attribute/displayed`).catch(() => null),
+        u2("GET", `/element/${elId}/attribute/class`).catch(() => null),
       ]);
       return json({ rect, text, enabled, displayed, name, elementId: elId });
     },
@@ -662,7 +662,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "android",
-          version: "0.1.11",
+          version: "0.1.12",
           context,
         }),
       });
