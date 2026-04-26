@@ -38,7 +38,14 @@ export async function ensureDevice(): Promise<DeviceInfo> {
   if (active) {
     const found = ready.find((d) => d.serial === active);
     if (found) return found;
-    setActiveSerial(null);
+    // Previously-selected device is gone. Do NOT silently fall back to another
+    // connected device — that's how multi-device sessions end up driving the
+    // wrong phone. Force the caller to re-select explicitly.
+    const others = ready.map((d) => d.serial).join(", ") || "none ready";
+    throw new Error(
+      `Previously selected device ${active} is no longer ready (other devices: ${others}). ` +
+        `Call select_device { serial } to choose one.`,
+    );
   }
   if (ready.length === 0) {
     const offline = devices.filter((d) => d.state !== "device");
@@ -47,7 +54,7 @@ export async function ensureDevice(): Promise<DeviceInfo> {
       : " — connect one or launch an emulator";
     throw new Error(`No Android devices ready${hint}`);
   }
-  if (ready.length > 1 && !active) {
+  if (ready.length > 1) {
     throw new Error(
       `Multiple devices connected (${ready.map((d) => d.serial).join(", ")}). ` +
         `Call select_device { serial } first.`,
@@ -64,7 +71,14 @@ export async function selectDevice(serial: string): Promise<DeviceInfo> {
   if (found.state !== "device") {
     throw new Error(`Device ${serial} is ${found.state}, not ready`);
   }
+  const previous = getActiveSerial();
   setActiveSerial(serial);
+  if (previous && previous !== serial) {
+    // Existing UIAutomator2 session is bound to the old device — kill it so the
+    // next u2() call rebuilds against the newly selected serial.
+    const { teardownSession } = await import("./uiautomator2.js");
+    await teardownSession();
+  }
   return found;
 }
 

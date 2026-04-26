@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { adb, adbShell, adbSpawn } from "./adb.js";
+import { adb, adbShell, adbSpawn, getActiveSerial } from "./adb.js";
 import { ensureDevice } from "./devices.js";
 
 // Default Appium UIAutomator2 server port (on device).
@@ -19,6 +19,31 @@ const APK_TEST_URL =
 let sessionId: string | null = null;
 let localPort: number | null = null;
 let serverProc: import("node:child_process").ChildProcess | null = null;
+let sessionSerial: string | null = null;
+
+export async function teardownSession(): Promise<void> {
+  // Best-effort: release HTTP session, kill instrumentation, drop port forward.
+  if (sessionId && localPort) {
+    try {
+      await fetch(`http://127.0.0.1:${localPort}/wd/hub/session/${sessionId}`, {
+        method: "DELETE",
+        signal: AbortSignal.timeout(1000),
+      });
+    } catch { /* ignore */ }
+  }
+  if (serverProc && !serverProc.killed) {
+    try { serverProc.kill("SIGKILL"); } catch { /* ignore */ }
+  }
+  if (sessionSerial && localPort) {
+    try {
+      await adb(["-s", sessionSerial, "forward", "--remove", `tcp:${localPort}`]);
+    } catch { /* ignore */ }
+  }
+  sessionId = null;
+  localPort = null;
+  serverProc = null;
+  sessionSerial = null;
+}
 
 function log(...args: unknown[]) {
   // eslint-disable-next-line no-console
@@ -144,13 +169,22 @@ async function createSession(): Promise<string> {
 }
 
 export async function ensureSession(): Promise<string> {
+  const dev = await ensureDevice();
+  // If the active device changed since the session was created, the session,
+  // port forward, and instrumentation are bound to the OLD device. Tear down
+  // and rebuild against the new one — otherwise u2() silently talks to the
+  // wrong phone.
+  if (sessionId && sessionSerial && sessionSerial !== dev.serial) {
+    log(`active device changed (${sessionSerial} → ${dev.serial}), rebuilding session`);
+    await teardownSession();
+  }
   if (sessionId) return sessionId;
-  await ensureDevice();
   await ensureServerInstalled();
   localPort = await pickLocalPort();
   await adbForward(localPort, U2_PORT);
   await startServer();
   await waitForServer();
+  sessionSerial = dev.serial;
   // UiAutomation finishes wiring up a bit after HTTP is ready — retry session creation.
   let lastErr: unknown = null;
   for (let attempt = 0; attempt < 6; attempt++) {
