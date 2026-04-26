@@ -20,6 +20,20 @@ let consecutiveSingleCalls = 0;
 let callsSinceLastNudge = Infinity;
 const BATCH_NUDGE = `\n\n[hint] You've made ${BATCH_NUDGE_THRESHOLD}+ tool calls in a row. When you're confident about the next 2-3 steps, batch them with \`run_script { script: { steps: [{tool, args}, ...] } }\` to save round-trips. It stops at the first failure and the report tells you which step \`i\` to resume at.`;
 
+const lastFailures = new Map<string, number>();
+const FEEDBACK_HINT = `\n\n[hint] If this error looks like an MCP bug (not a flow mistake), you can report it directly with \`send_feedback { message: "<what you tried, what failed, expected behavior>", severity: "bug" }\` — it opens a GitHub issue with the last ~20 tool calls attached as context.`;
+
+function maybeAppendFeedbackHint(toolName: string, text: string): string {
+  if (toolName === "send_feedback") return text;
+  const count = (lastFailures.get(toolName) ?? 0) + 1;
+  lastFailures.set(toolName, count);
+  if (count >= 2) {
+    lastFailures.set(toolName, 0);
+    return text + FEEDBACK_HINT;
+  }
+  return text;
+}
+
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: tools.map((t) => ({
     name: t.name,
@@ -39,6 +53,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const result = await tool.handler(args as Record<string, unknown>);
     const preview = result.content.find((c) => c.type === "text")?.text;
     recordCall(tool.name, args, !result.isError, preview);
+    if (result.isError) {
+      const firstText = result.content.find((c) => c.type === "text");
+      if (firstText && typeof firstText.text === "string") {
+        firstText.text = maybeAppendFeedbackHint(tool.name, firstText.text);
+      }
+    } else {
+      lastFailures.set(tool.name, 0);
+    }
     if (tool.name === "run_script") {
       consecutiveSingleCalls = 0;
     } else {
@@ -59,7 +81,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     recordCall(tool.name, rawArgs, false, message);
-    return { content: [{ type: "text", text: message }], isError: true };
+    return {
+      content: [{ type: "text", text: maybeAppendFeedbackHint(tool.name, message) }],
+      isError: true,
+    };
   }
 });
 

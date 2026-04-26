@@ -1036,7 +1036,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "chrome",
-          version: "0.2.3",
+          version: "0.2.4",
           context,
         }),
       });
