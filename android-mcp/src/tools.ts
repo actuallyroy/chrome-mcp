@@ -9,6 +9,13 @@ import {
   listDevices,
   selectDevice,
 } from "./devices.js";
+import {
+  FLOW_NAME_RE,
+  deleteFlowFile,
+  flowAsTool,
+  listFlowDocs,
+  writeFlow,
+} from "./flows.js";
 import { resolveElementId, type LocatorArgs } from "./locators.js";
 import { outline } from "./outline.js";
 import { readLogcat } from "./logcat.js";
@@ -37,6 +44,14 @@ export type ToolResult = {
 const text = (s: string): ToolResult => ({ content: [{ type: "text", text: s }] });
 const json = (o: unknown): ToolResult => text(JSON.stringify(o, null, 2));
 const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+// Hook the dispatcher uses to notify the MCP client when the tool list
+// changes (e.g., after save_flow / delete_flow). Set from index.ts.
+let notifyToolsChanged: (() => void) | null = null;
+export function setNotifyToolsChanged(fn: () => void) { notifyToolsChanged = fn; }
+function emitToolsChanged() { if (notifyToolsChanged) notifyToolsChanged(); }
+
+const FLOW_CAP = 20;
 
 // Mirror the dispatcher's auto-dismiss policy so run_script steps get the
 // same overlay clearing the top-level calls get.
@@ -101,6 +116,60 @@ const KEYCODES: Record<string, number> = {
   // Letters (subset; used by `rn_dev_reload` and as ad-hoc shortcuts).
   R: 46, D: 32, M: 41,
 };
+
+// Shared step-loop used by both run_script and saved-flow tools. Same
+// auto-dismiss policy as the top-level dispatcher.
+export async function runSteps(
+  steps: { tool: string; args?: Record<string, unknown>; skip?: boolean; on_error?: "continue" | "stop" }[],
+  opts: { continue_on_error?: boolean; dry_run?: boolean; verbose?: boolean; start_at?: number; end_at?: number; only?: number } = {},
+): Promise<ToolResult> {
+  const { continue_on_error = false, dry_run = false, verbose = false, start_at, end_at, only } = opts;
+  if (!steps.length) throw new Error("runSteps: no steps");
+  const from = only != null ? only : (start_at ?? 0);
+  const to = only != null ? only : (end_at != null ? end_at : steps.length - 1);
+  if (from < 0 || from >= steps.length) throw new Error(`start index ${from} out of range (0..${steps.length - 1})`);
+  if (to < from || to >= steps.length) throw new Error(`end index ${to} out of range (${from}..${steps.length - 1})`);
+  const report: { i: number; tool: string; ok: boolean; ms: number; result_preview?: string; result?: string; error?: string }[] = [];
+  for (let i = from; i <= to; i++) {
+    const step = steps[i];
+    if (step.skip) { report.push({ i, tool: step.tool, ok: true, ms: 0, result_preview: "skipped" }); continue; }
+    if (dry_run) { report.push({ i, tool: step.tool, ok: true, ms: 0, result_preview: "(dry run)" }); continue; }
+    const tool = tools.find((t) => t.name === step.tool);
+    if (!tool) {
+      report.push({ i, tool: step.tool, ok: false, ms: 0, error: "unknown tool" });
+      if (!continue_on_error && step.on_error !== "continue") return json({ ok: false, stopped_at: i, report });
+      continue;
+    }
+    if (!RUN_SCRIPT_SKIP_AUTO_DISMISS.has(step.tool)) {
+      try { await dismissDevOverlay(); } catch { /* best-effort */ }
+    }
+    const t0 = Date.now();
+    try {
+      const validated = tool.schema.parse(step.args ?? {});
+      const r = await tool.handler(validated as Record<string, unknown>);
+      if (RUN_SCRIPT_INTERACTIVE.has(step.tool)) {
+        try { await dismissDevOverlay(); } catch { /* best-effort */ }
+      }
+      const fullText = r.content.find((c) => c.type === "text")?.text;
+      const preview = fullText?.slice(0, 200);
+      if (r.isError) {
+        report.push({ i, tool: step.tool, ok: false, ms: Date.now() - t0, error: preview });
+        if (!continue_on_error && step.on_error !== "continue") return json({ ok: false, stopped_at: i, report });
+        continue;
+      }
+      const entry: { i: number; tool: string; ok: boolean; ms: number; result_preview?: string; result?: string } = {
+        i, tool: step.tool, ok: true, ms: Date.now() - t0,
+      };
+      if (verbose) entry.result = fullText; else entry.result_preview = preview;
+      report.push(entry);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      report.push({ i, tool: step.tool, ok: false, ms: Date.now() - t0, error: msg });
+      if (!continue_on_error && step.on_error !== "continue") return json({ ok: false, stopped_at: i, report });
+    }
+  }
+  return json({ ok: true, steps_run: report.length, report });
+}
 
 export const tools: Tool[] = [
   // ---- Device lifecycle --------------------------------------------------
@@ -605,62 +674,7 @@ export const tools: Tool[] = [
       const parsed = path ? JSON.parse(readFileSync(path, "utf8")) : script;
       if (!parsed) throw new Error("run_script: provide path or script");
       const steps = parsed.steps ?? parsed.entries ?? [];
-      if (!steps.length) throw new Error("run_script: no steps");
-      const from = only != null ? only : (start_at ?? 0);
-      const to = only != null ? only : (end_at != null ? end_at : steps.length - 1);
-      if (from < 0 || from >= steps.length) throw new Error(`start index ${from} out of range (0..${steps.length - 1})`);
-      if (to < from || to >= steps.length) throw new Error(`end index ${to} out of range (${from}..${steps.length - 1})`);
-      const report: {
-        i: number; tool: string; ok: boolean; ms: number;
-        result_preview?: string; result?: string; error?: string;
-      }[] = [];
-      for (let i = from; i <= to; i++) {
-        const step = steps[i] as {
-          tool: string;
-          args?: Record<string, unknown>;
-          skip?: boolean;
-          on_error?: "continue" | "stop";
-        };
-        if (step.skip) { report.push({ i, tool: step.tool, ok: true, ms: 0, result_preview: "skipped" }); continue; }
-        if (dry_run) { report.push({ i, tool: step.tool, ok: true, ms: 0, result_preview: "(dry run)" }); continue; }
-        const tool = tools.find((t) => t.name === step.tool);
-        if (!tool) {
-          report.push({ i, tool: step.tool, ok: false, ms: 0, error: "unknown tool" });
-          if (!continue_on_error && step.on_error !== "continue") return json({ ok: false, stopped_at: i, report });
-          continue;
-        }
-        // Same wrap-around as the top-level dispatcher: dismiss dev overlays
-        // before/after interactive steps so a popup raised by step N doesn't
-        // block step N+1's locator.
-        if (!RUN_SCRIPT_SKIP_AUTO_DISMISS.has(step.tool)) {
-          try { await dismissDevOverlay(); } catch { /* best-effort */ }
-        }
-        const t0 = Date.now();
-        try {
-          const validated = tool.schema.parse(step.args ?? {});
-          const r = await tool.handler(validated as Record<string, unknown>);
-          if (RUN_SCRIPT_INTERACTIVE.has(step.tool)) {
-            try { await dismissDevOverlay(); } catch { /* best-effort */ }
-          }
-          const fullText = r.content.find((c) => c.type === "text")?.text;
-          const preview = fullText?.slice(0, 200);
-          if (r.isError) {
-            report.push({ i, tool: step.tool, ok: false, ms: Date.now() - t0, error: preview });
-            if (!continue_on_error && step.on_error !== "continue") return json({ ok: false, stopped_at: i, report });
-            continue;
-          }
-          const entry: { i: number; tool: string; ok: boolean; ms: number; result_preview?: string; result?: string } = {
-            i, tool: step.tool, ok: true, ms: Date.now() - t0,
-          };
-          if (verbose) entry.result = fullText; else entry.result_preview = preview;
-          report.push(entry);
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          report.push({ i, tool: step.tool, ok: false, ms: Date.now() - t0, error: msg });
-          if (!continue_on_error && step.on_error !== "continue") return json({ ok: false, stopped_at: i, report });
-        }
-      }
-      return json({ ok: true, steps_run: report.length, report });
+      return runSteps(steps, { continue_on_error, dry_run, verbose, start_at, end_at, only });
     },
   },
   {
@@ -699,7 +713,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "android",
-          version: "0.1.15",
+          version: "0.1.16",
           context,
         }),
       });
@@ -711,5 +725,137 @@ export const tools: Tool[] = [
       return text(`filed issue #${parsed.issue_number} — ${parsed.url}`);
     },
   },
+  {
+    name: "save_flow",
+    description:
+      "Persist a sequence of steps as a named MCP tool. The flow shows up in the tool list immediately (no reconnect needed). Steps may reference {{param}} placeholders; declare params so callers know what to pass.\n\n" +
+      "Naming: lowercase, [a-z0-9_], 3-50 chars, must not collide with built-ins.\n" +
+      `Cap: at most ${FLOW_CAP} saved flows total.\n\n` +
+      "Example:\n" +
+      `  save_flow {\n` +
+      `    name: "checkin_store",\n` +
+      `    description: "Open Stores, pick a store by name, force check-in with OTP",\n` +
+      `    params: [{ name: "store", type: "string" }, { name: "otp", type: "string" }],\n` +
+      `    steps: [\n` +
+      `      { tool: "click", args: { text: "Stores" } },\n` +
+      `      { tool: "scroll", args: { until_text: "{{store}}" } },\n` +
+      `      { tool: "click", args: { text: "{{store}}" } },\n` +
+      `      { tool: "fill", args: { id: "otp_input", value: "{{otp}}" } }\n` +
+      `    ]\n` +
+      `  }`,
+    schema: z.object({
+      name: z.string(),
+      description: z.string().min(1).max(500),
+      params: z
+        .array(
+          z.object({
+            name: z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/),
+            type: z.enum(["string", "number", "boolean"]).default("string"),
+            description: z.string().optional(),
+            required: z.boolean().optional(),
+          }),
+        )
+        .max(20)
+        .optional(),
+      steps: z
+        .array(z.object({ tool: z.string(), args: z.record(z.any()).optional() }))
+        .min(1)
+        .max(200),
+      overwrite: z.boolean().default(false),
+    }),
+    handler: async (args) => {
+      const a = args as {
+        name: string;
+        description: string;
+        params?: { name: string; type: "string" | "number" | "boolean"; description?: string; required?: boolean }[];
+        steps: { tool: string; args?: Record<string, unknown> }[];
+        overwrite: boolean;
+      };
+      if (!FLOW_NAME_RE.test(a.name)) {
+        throw new Error(`Invalid flow name "${a.name}" — must match ${FLOW_NAME_RE.source}`);
+      }
+      if (RESERVED_TOOL_NAMES.has(a.name)) {
+        throw new Error(`Name "${a.name}" collides with a built-in tool. Pick a different name.`);
+      }
+      const existingIdx = tools.findIndex((t) => t.name === a.name);
+      const existingIsFlow = existingIdx >= 0 && savedFlowNames.has(a.name);
+      if (existingIdx >= 0 && !existingIsFlow) {
+        throw new Error(`Tool "${a.name}" already exists. Pick a different name.`);
+      }
+      if (existingIsFlow && !a.overwrite) {
+        throw new Error(`Flow "${a.name}" already exists. Pass overwrite: true to replace it.`);
+      }
+      // Cap is over flows only, not built-ins.
+      if (!existingIsFlow && savedFlowNames.size >= FLOW_CAP) {
+        throw new Error(
+          `At ${FLOW_CAP} saved flows already — delete one with delete_flow before saving more. ` +
+            `(The cap exists so the agent's tool list stays manageable.)`,
+        );
+      }
+      // Reject step tools that don't exist now (catches typos at save time).
+      for (const s of a.steps) {
+        if (!tools.find((t) => t.name === s.tool) && s.tool !== a.name) {
+          throw new Error(`Step references unknown tool "${s.tool}".`);
+        }
+      }
+      writeFlow({ name: a.name, description: a.description, params: a.params, steps: a.steps });
+      const tool = flowAsTool({ name: a.name, description: a.description, params: a.params, steps: a.steps });
+      if (existingIdx >= 0) tools[existingIdx] = tool;
+      else tools.push(tool);
+      savedFlowNames.add(a.name);
+      emitToolsChanged();
+      return text(`saved flow "${a.name}" (${a.steps.length} steps). Available immediately as an MCP tool.`);
+    },
+  },
+  {
+    name: "list_flows",
+    description: "List saved flows (the ones registered as MCP tools by save_flow).",
+    schema: z.object({}),
+    handler: async () => {
+      const docs = listFlowDocs();
+      return json(docs.map((d) => ({
+        name: d.name,
+        description: d.description,
+        steps: d.steps.length,
+        params: d.params?.map((p) => p.name) ?? [],
+        saved_at: d.saved_at,
+      })));
+    },
+  },
+  {
+    name: "delete_flow",
+    description: "Delete a saved flow and unregister its MCP tool.",
+    schema: z.object({ name: z.string() }),
+    handler: async (args) => {
+      const { name } = args as { name: string };
+      if (!savedFlowNames.has(name)) throw new Error(`No saved flow named "${name}".`);
+      deleteFlowFile(name);
+      const idx = tools.findIndex((t) => t.name === name);
+      if (idx >= 0) tools.splice(idx, 1);
+      savedFlowNames.delete(name);
+      emitToolsChanged();
+      return text(`deleted flow "${name}"`);
+    },
+  },
 ];
+
+const savedFlowNames = new Set<string>();
+let RESERVED_TOOL_NAMES: Set<string> = new Set();
+
+// Load saved flows from disk into the tools registry. Called once at startup
+// from index.ts, after the built-in tools array is initialized — that's when
+// we lock in the reserved-name set.
+export function loadSavedFlows(): { loaded: number; skipped: number } {
+  RESERVED_TOOL_NAMES = new Set(tools.map((t) => t.name));
+  let loaded = 0;
+  let skipped = 0;
+  for (const doc of listFlowDocs()) {
+    if (!FLOW_NAME_RE.test(doc.name) || RESERVED_TOOL_NAMES.has(doc.name)) { skipped++; continue; }
+    if (savedFlowNames.size >= FLOW_CAP) { skipped++; continue; }
+    tools.push(flowAsTool(doc));
+    savedFlowNames.add(doc.name);
+    loaded++;
+  }
+  return { loaded, skipped };
+}
 

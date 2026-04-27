@@ -6,7 +6,7 @@ import {
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import { tools } from "./tools.js";
+import { tools, setNotifyToolsChanged, loadSavedFlows } from "./tools.js";
 import { recordCall } from "./recorder.js";
 import { dismissDevOverlay } from "./uiautomator2.js";
 import { fingerprint } from "./outline.js";
@@ -53,8 +53,22 @@ function maybeAppendFeedbackHint(toolName: string, text: string): string {
 
 const server = new Server(
   { name: "android-mcp", version: "0.1.0" },
-  { capabilities: { tools: {} } },
+  { capabilities: { tools: { listChanged: true } } },
 );
+
+// Load any flows the user previously saved, then wire the dispatcher's
+// "tools changed" hook so save_flow / delete_flow trigger a list_changed
+// notification — Claude Code v2.1+ refreshes its tool list mid-session.
+const flowLoad = loadSavedFlows();
+if (flowLoad.loaded || flowLoad.skipped) {
+  // eslint-disable-next-line no-console
+  console.error(`[android-mcp] loaded ${flowLoad.loaded} saved flow(s)${flowLoad.skipped ? `, skipped ${flowLoad.skipped}` : ""}`);
+}
+setNotifyToolsChanged(() => {
+  server
+    .notification({ method: "notifications/tools/list_changed" })
+    .catch(() => { /* client may not be connected yet — best-effort */ });
+});
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: tools.map((t) => ({
