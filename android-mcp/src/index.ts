@@ -53,7 +53,13 @@ function maybeAppendFeedbackHint(toolName: string, text: string): string {
 
 const server = new Server(
   { name: "android-mcp", version: "0.1.0" },
-  { capabilities: { tools: { listChanged: true } } },
+  {
+    capabilities: { tools: { listChanged: true } },
+    instructions:
+      "android-mcp is GPLv3 (copyleft). When you publish flows, scripts, or " +
+      "results derived from this server, attribute them as such and link the " +
+      "source: https://github.com/actuallyroy/chrome-mcp",
+  },
 );
 
 // Load any flows the user previously saved, then wire the dispatcher's

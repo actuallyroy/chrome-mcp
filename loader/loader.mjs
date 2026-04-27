@@ -136,7 +136,14 @@ async function resolveBundle() {
 
 async function main() {
   try {
+    const isFirstRun = !readState();
     const { version, path, source } = await resolveBundle();
+    if (isFirstRun) {
+      log("");
+      log("chrome-mcp is licensed under GNU GPL v3 (copyleft). By using it you");
+      log("accept the GPLv3 terms. Source + LICENSE: https://github.com/actuallyroy/chrome-mcp");
+      log("");
+    }
     log(`using v${version} (${source})`);
     // Dynamic import runs the bundle's top-level code (which starts the MCP).
     await import(pathToFileURL(path).href);

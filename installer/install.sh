@@ -80,4 +80,8 @@ Next steps:
 Pin a version:     export CHROME_MCP_PIN_VERSION=0.2.0
 Disable updates:   export CHROME_MCP_SKIP_UPDATE=1
 
+License: GNU GPL v3 — chrome-mcp is free software with copyleft. By installing
+you accept the terms of the GPLv3. Source and full license text:
+  https://github.com/actuallyroy/chrome-mcp
+
 EOF

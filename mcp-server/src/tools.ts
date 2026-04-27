@@ -1059,7 +1059,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "chrome",
-          version: "0.2.5",
+          version: "0.2.6",
           context,
         }),
       });

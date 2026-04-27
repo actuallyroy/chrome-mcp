@@ -167,3 +167,21 @@ npx http-server ./public -p 18888
 # Terminal 2: run Claude Code with
 CHROME_MCP_ENDPOINT=http://127.0.0.1:18888 ~/.chrome-mcp/bin/chrome-mcp
 ```
+
+---
+
+## License
+
+chrome-mcp and android-mcp are released under the **GNU General Public License v3.0** (see [`LICENSE`](./LICENSE)).
+
+GPLv3 is a copyleft license. In short:
+
+- ✅ Use it freely — personally, internally, for clients, in CI, anywhere. There is no usage restriction.
+- ✅ Modify it freely.
+- ⚠️ **If you redistribute** it (binaries, forks, repackaged installers, hosted services that ship the code to users), the redistributed work must also be GPLv3 and you must make the corresponding source available to recipients.
+- ⚠️ Code that links into / extends the MCP servers (custom tools compiled in, forks of the loader/bundle) inherits GPLv3.
+- ❌ You can't sublicense it under MIT/Apache/proprietary.
+
+Bundled third-party deps (`puppeteer-core`, `@modelcontextprotocol/sdk`, `pngjs`, the Appium UIAutomator2 server APK) are Apache-2.0 / MIT and are GPLv3-compatible.
+
+If you're unsure whether your use case requires source disclosure, the practical rule of thumb is: *internal use never does; redistribution does*.

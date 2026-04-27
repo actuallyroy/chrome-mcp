@@ -86,7 +86,14 @@ async function resolveBundle() {
 
 async function main() {
   try {
+    const isFirstRun = !readState();
     const { version, path, source } = await resolveBundle();
+    if (isFirstRun) {
+      log("");
+      log("android-mcp is licensed under GNU GPL v3 (copyleft). By using it you");
+      log("accept the GPLv3 terms. Source + LICENSE: https://github.com/actuallyroy/chrome-mcp");
+      log("");
+    }
     log(`using v${version} (${source})`);
     await import(pathToFileURL(path).href);
   } catch (err) {
