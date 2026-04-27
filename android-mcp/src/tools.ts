@@ -22,6 +22,7 @@ import {
   clearElement,
   clickElement,
   dismissDevOverlay,
+  dumpSource,
   pressKeyCode,
   screenshot as u2Screenshot,
   setElementValue,
@@ -97,6 +98,8 @@ const KEYCODES: Record<string, number> = {
   VOLUME_UP: 24, VOLUME_DOWN: 25, POWER: 26, CAMERA: 27, MENU: 82,
   ENTER: 66, DEL: 67, TAB: 61, SPACE: 62, ESCAPE: 111,
   APP_SWITCH: 187,
+  // Letters (subset; used by `rn_dev_reload` and as ad-hoc shortcuts).
+  R: 46, D: 32, M: 41,
 };
 
 export const tools: Tool[] = [
@@ -225,9 +228,43 @@ export const tools: Tool[] = [
     description: "Tap an element. Locator: ref | text | desc | id | xpath | class | selector.",
     schema: z.object(Locator),
     handler: async (args) => {
-      const elId = await resolveElementId(args as LocatorArgs);
-      await clickElement(elId);
-      return text(`clicked ${elId}`);
+      try {
+        const elId = await resolveElementId(args as LocatorArgs);
+        await clickElement(elId);
+        return text(`clicked ${elId}`);
+      } catch (e) {
+        const msg = (e as Error).message || String(e);
+        // RN red-box ("Could not connect to development server", "JavaScript exception")
+        // renders its buttons in a custom view that isn't introspectable by text/desc.
+        // Detect it and tell the agent to use the keyboard shortcut instead.
+        if (/no such element|not located/i.test(msg)) {
+          try {
+            const xml = await dumpSource();
+            if (/Could not connect to development server|RCTJSError|RedBox/i.test(xml)) {
+              throw new Error(
+                msg +
+                  "\n\n[hint] React Native red-box detected — its buttons aren't in the view hierarchy. " +
+                  "Use `rn_dev_reload` (sends KEYCODE_R twice) to reload, or `press_key { key: \"ESCAPE\" }` to dismiss.",
+              );
+            }
+          } catch (innerErr) {
+            if (innerErr !== e && (innerErr as Error).message.includes("[hint]")) throw innerErr;
+          }
+        }
+        throw e;
+      }
+    },
+  },
+  {
+    name: "rn_dev_reload",
+    description:
+      "Reload a React Native app via the dev shortcut: sends KEYCODE_R twice. Works even when the red-box error overlay is up (its buttons aren't in the UiAutomator tree, so `click` can't find them).",
+    schema: z.object({}),
+    handler: async () => {
+      await pressKeyCode(KEYCODES.R);
+      await new Promise((r) => setTimeout(r, 100));
+      await pressKeyCode(KEYCODES.R);
+      return text("RN dev reload triggered (R, R)");
     },
   },
   {
@@ -662,7 +699,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "android",
-          version: "0.1.14",
+          version: "0.1.15",
           context,
         }),
       });

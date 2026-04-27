@@ -206,6 +206,15 @@ export async function u2(
   path: string,
   body?: unknown,
 ): Promise<unknown> {
+  return u2Inner(method, path, body, false);
+}
+
+async function u2Inner(
+  method: "GET" | "POST" | "DELETE",
+  path: string,
+  body: unknown,
+  isRetry: boolean,
+): Promise<unknown> {
   const sid = await ensureSession();
   const r = await fetch(`http://127.0.0.1:${localPort}/wd/hub/session/${sid}${path}`, {
     method,
@@ -216,6 +225,19 @@ export async function u2(
   let parsed: unknown = null;
   try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
   if (!r.ok) {
+    // The cached session is dead (common after AVD cold-boot, instrumentation
+    // crash, or `am force-stop` of the test runner). Tear down and rebuild
+    // against the same serial, then retry once. Without this, every subsequent
+    // call 404s and the user has to /mcp reconnect from outside.
+    const stale =
+      r.status === 404 &&
+      (/invalid session id/i.test(text) || /no such session/i.test(text)) &&
+      !isRetry;
+    if (stale) {
+      log(`u2 session ${sid} is stale (HTTP 404 invalid session id), rebuilding`);
+      await teardownSession();
+      return u2Inner(method, path, body, true);
+    }
     const msg = typeof parsed === "object" && parsed && "value" in parsed ? JSON.stringify((parsed as { value: unknown }).value) : text;
     throw new Error(`u2 ${method} ${path}: HTTP ${r.status} — ${msg}`);
   }

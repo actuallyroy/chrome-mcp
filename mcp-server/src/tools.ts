@@ -110,7 +110,21 @@ async function resolveLocator(page: Page, loc: LocatorArgs): Promise<ElementHand
 
 async function clickHandle(page: Page, h: ElementHandle<Element>) {
   await h.evaluate((el) => (el as HTMLElement).scrollIntoView({ block: "center", behavior: "instant" as ScrollBehavior }));
-  await h.click();
+  // h.click() ends with a Runtime.callFunctionOn that resolves only after the
+  // page's click handler returns. For form-submits / heavy SPA buttons that
+  // start synchronous work, that round-trip can hit puppeteer's protocolTimeout
+  // even though the click already fired. Instead, get the click point once,
+  // then dispatch raw mouse events via CDP — those are fire-and-forget and
+  // don't wait for handler completion.
+  const box = await h.boundingBox();
+  if (!box) {
+    // Element has no layout (display:none, detached). Fall back to h.click().
+    await h.click();
+    return;
+  }
+  const x = box.x + box.width / 2;
+  const y = box.y + box.height / 2;
+  await page.mouse.click(x, y);
 }
 
 async function fillHandle(page: Page, h: ElementHandle<Element>, value: string) {
@@ -290,7 +304,16 @@ export const tools: Tool[] = [
         };
         const h = await resolveLocator(p, loc);
         await h.evaluate((el) => (el as HTMLElement).scrollIntoView({ block: "center", behavior: "instant" as ScrollBehavior }));
-        await h.click({ button, count: click_count });
+        const box = await h.boundingBox();
+        if (box) {
+          const x = box.x + box.width / 2;
+          const y = box.y + box.height / 2;
+          // Raw mouse events via CDP are fire-and-forget; h.click() waits on
+          // Runtime.callFunctionOn which times out on heavy form-submit handlers.
+          await p.mouse.click(x, y, { button, count: click_count });
+        } else {
+          await h.click({ button, count: click_count });
+        }
         return text(`clicked (${loc.ref ? `ref=${loc.ref}` : loc.text ? `text="${loc.text}"` : loc.label ? `label="${loc.label}"` : loc.selector})`);
       }),
   },
@@ -1036,7 +1059,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "chrome",
-          version: "0.2.4",
+          version: "0.2.5",
           context,
         }),
       });

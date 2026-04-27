@@ -27,8 +27,36 @@ export async function resolveElementId(loc: LocatorArgs): Promise<string> {
     const value = loc.id.includes(":id/") ? loc.id : loc.id; // caller can pass either
     return findElement("id", value);
   }
-  if (loc.desc) return findElement("accessibility id", loc.desc);
-  if (loc.text) return findElement("-android uiautomator", `new UiSelector().text("${escapeU(loc.text)}")`);
+  if (loc.desc) {
+    try { return await findElement("accessibility id", loc.desc); } catch (e) {
+      // Fall back to descContains so case mismatches and trailing whitespace
+      // don't force the caller to guess the exact string.
+      try {
+        return await findElement(
+          "-android uiautomator",
+          `new UiSelector().descriptionContains("${escapeU(loc.desc)}")`,
+        );
+      } catch { throw e; }
+    }
+  }
+  if (loc.text) {
+    try {
+      return await findElement(
+        "-android uiautomator",
+        `new UiSelector().text("${escapeU(loc.text)}")`,
+      );
+    } catch (e) {
+      // Common miss: caller passed "Reload" but the actual label is "RELOAD"
+      // (or vice-versa). Try a case-insensitive contains match before giving up.
+      try {
+        return await findElement(
+          "-android uiautomator",
+          `new UiSelector().textMatches("(?i).*${escapeRegexForUi(loc.text)}.*")`,
+        );
+      } catch { /* fall through to original error */ }
+      throw e;
+    }
+  }
   if (loc.class) return findElement("class name", loc.class);
   if (loc.selector) return findElement("-android uiautomator", loc.selector);
   throw new Error("Provide one of: ref, text, desc, id, xpath, class, selector");
@@ -36,6 +64,11 @@ export async function resolveElementId(loc: LocatorArgs): Promise<string> {
 
 function escapeU(s: string) {
   return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+}
+
+function escapeRegexForUi(s: string) {
+  // Escape regex metas, then escape backslashes/quotes for the UiSelector string.
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replace(/"/g, '\\"');
 }
 
 async function findElementFromNode(n: Node): Promise<string> {
