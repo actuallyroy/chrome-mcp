@@ -78,7 +78,12 @@ export async function adbShell(
 
 export function adbSpawn(args: string[]): ChildProcess {
   const bin = findAdb();
-  return spawn(bin, [...baseArgs(), ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  // If the caller already passed an explicit `-s <serial>` (first two args),
+  // skip baseArgs to avoid duplicate `-s` flags. Otherwise fall back to the
+  // active serial.
+  const hasExplicitSerial = args[0] === "-s";
+  const prefix = hasExplicitSerial ? [] : baseArgs();
+  return spawn(bin, [...prefix, ...args], { stdio: ["ignore", "pipe", "pipe"] });
 }
 
 // Cached screen size from `adb shell wm size`. Avoid calling the v9-incompatible

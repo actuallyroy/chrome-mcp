@@ -746,7 +746,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "android",
-          version: "0.1.20",
+          version: "0.1.21",
           context,
         }),
       });

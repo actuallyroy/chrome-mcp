@@ -50,18 +50,56 @@ function log(...args: unknown[]) {
   console.error("[android-mcp]", ...args);
 }
 
+// Pick a local port for the upcoming session. `adb forward tcp:<host> ...`
+// is host-global — running the same port against multiple devices silently
+// overrides the mapping. To avoid that race (issue #4), each new session
+// claims a fresh port, scanning for one that isn't already claimed by adb.
+let nextLocalPortCandidate = Number(process.env.ANDROID_MCP_LOCAL_PORT ?? U2_PORT);
+
+async function listAdbForwardPorts(): Promise<Set<number>> {
+  // `adb forward --list` prints lines like "emulator-5554 tcp:6790 tcp:6790".
+  try {
+    const { stdout } = await adb(["forward", "--list"]);
+    const out = new Set<number>();
+    for (const line of stdout.split("\n")) {
+      const m = line.match(/\stcp:(\d+)\s+tcp:\d+/);
+      if (m) out.add(Number(m[1]));
+    }
+    return out;
+  } catch { return new Set(); }
+}
+
 async function pickLocalPort(): Promise<number> {
-  // Simple approach: use U2_PORT locally too. Configurable via env if conflict.
-  return Number(process.env.ANDROID_MCP_LOCAL_PORT ?? U2_PORT);
+  const claimed = await listAdbForwardPorts();
+  // Try up to 64 candidates starting from the configured base. Skip ports
+  // already claimed by any other forward (regardless of which device they
+  // route to) — claiming one of those would silently steal traffic.
+  for (let i = 0; i < 64; i++) {
+    const candidate = nextLocalPortCandidate + i;
+    if (!claimed.has(candidate)) {
+      nextLocalPortCandidate = candidate + 1;
+      return candidate;
+    }
+  }
+  // Fallback: use base + 64; the user's adb is heavily loaded, but at least
+  // we don't infinite-loop.
+  const fallback = nextLocalPortCandidate + 64;
+  nextLocalPortCandidate = fallback + 1;
+  return fallback;
 }
 
 async function adbForward(local: number, remote: number) {
-  await adb(["forward", `tcp:${local}`, `tcp:${remote}`]);
+  // --no-rebind makes adb fail if another forward already owns this local
+  // port — surfaces collisions instead of silently overriding. pickLocalPort
+  // already filters claimed ports, so the only way to land here with a
+  // collision is a TOCTOU race; better to fail loudly than route to the
+  // wrong device.
+  await adb(["forward", "--no-rebind", `tcp:${local}`, `tcp:${remote}`]);
 }
 
-async function isPackageInstalled(pkg: string): Promise<boolean> {
-  const out = await adbShell(`pm list packages ${pkg}`);
-  return out.split("\n").some((l) => l.trim() === `package:${pkg}`);
+async function isPackageInstalled(serial: string, pkg: string): Promise<boolean> {
+  const { stdout } = await adb(["-s", serial, "shell", `pm list packages ${pkg}`]);
+  return stdout.split("\n").some((l) => l.trim() === `package:${pkg}`);
 }
 
 async function cachedApk(name: string, url: string): Promise<string> {
@@ -84,33 +122,36 @@ async function cachedApk(name: string, url: string): Promise<string> {
   return path;
 }
 
-async function ensureServerInstalled() {
+async function ensureServerInstalled(serial: string) {
   const [hasMain, hasTest] = await Promise.all([
-    isPackageInstalled(SERVER_PKG),
-    isPackageInstalled(SERVER_TEST_PKG),
+    isPackageInstalled(serial, SERVER_PKG),
+    isPackageInstalled(serial, SERVER_TEST_PKG),
   ]);
   if (hasMain && hasTest) return;
-  log("installing UIAutomator2 server APKs…");
+  log(`installing UIAutomator2 server APKs on ${serial}…`);
   if (!hasMain) {
     const apk = await cachedApk("uiautomator2-server.apk", APK_URL);
-    await adb(["install", "-r", "-g", apk], { timeout_ms: 120_000 });
+    await adb(["-s", serial, "install", "-r", "-g", apk], { timeout_ms: 120_000 });
   }
   if (!hasTest) {
     const apk = await cachedApk("uiautomator2-server-test.apk", APK_TEST_URL);
-    await adb(["install", "-r", "-g", apk], { timeout_ms: 120_000 });
+    await adb(["-s", serial, "install", "-r", "-g", apk], { timeout_ms: 120_000 });
   }
 }
 
-async function startServer() {
+async function startServer(serial: string) {
   if (serverProc && !serverProc.killed) return;
   // Kill any stale server + instrumentation from prior sessions (common source of
-  // "UiAutomation not connected" on next start).
+  // "UiAutomation not connected" on next start). Pin -s explicitly — relying on
+  // the implicit "active device" lets a multi-device race route this to the
+  // wrong phone (see issue #4).
   try {
-    await adbShell(`am force-stop ${SERVER_PKG}`);
-    await adbShell(`am force-stop ${SERVER_TEST_PKG}`);
+    await adb(["-s", serial, "shell", `am force-stop ${SERVER_PKG}`]);
+    await adb(["-s", serial, "shell", `am force-stop ${SERVER_TEST_PKG}`]);
   } catch { /* ignore */ }
   // am instrument blocks for the duration of the test run; keep it as a background process.
   serverProc = adbSpawn([
+    "-s", serial,
     "shell",
     "am", "instrument",
     "-w", "-r",
@@ -179,12 +220,19 @@ export async function ensureSession(): Promise<string> {
     await teardownSession();
   }
   if (sessionId) return sessionId;
-  await ensureServerInstalled();
+  await ensureServerInstalled(dev.serial);
   localPort = await pickLocalPort();
-  await adbForward(localPort, U2_PORT);
-  await startServer();
-  await waitForServer();
+  // Pin sessionSerial NOW, before any adb call that depends on baseArgs(),
+  // so adbForward / startServer can't pick a different device if active
+  // shifts mid-init.
   sessionSerial = dev.serial;
+  // Forward against the explicit serial — adb's "no -s" form picks an
+  // arbitrary connected device, which is exactly the multi-device bug we
+  // saw (issue #4: forward set against wrong emulator → screenshot returned
+  // 5554 even though active was 5556).
+  await adb(["-s", dev.serial, "forward", "--no-rebind", `tcp:${localPort}`, `tcp:${U2_PORT}`]);
+  await startServer(dev.serial);
+  await waitForServer();
   // UiAutomation finishes wiring up a bit after HTTP is ready — retry session creation.
   let lastErr: unknown = null;
   for (let attempt = 0; attempt < 6; attempt++) {
