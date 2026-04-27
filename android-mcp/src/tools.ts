@@ -60,8 +60,12 @@ const RUN_SCRIPT_INTERACTIVE = new Set<string>([
   "launch_app", "stop_app", "install_app", "clear_app_data",
 ]);
 const RUN_SCRIPT_SKIP_AUTO_DISMISS = new Set<string>([
-  "dismiss_dev_overlay", "list_devices", "select_device", "device_info",
-  "get_logcat", "recording_status", "start_recording", "stop_recording",
+  "dismiss_dev_overlay",
+  "list_devices", "select_device", "device_info", "current_app",
+  "screenshot", "outline", "describe", "wait_for_stable", "assert",
+  "get_logcat", "adb_shell",
+  "recording_status", "start_recording", "stop_recording",
+  "save_flow", "list_flows", "delete_flow",
   "send_feedback",
 ]);
 
@@ -713,7 +717,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "android",
-          version: "0.1.17",
+          version: "0.1.18",
           context,
         }),
       });

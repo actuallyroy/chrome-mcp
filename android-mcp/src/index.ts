@@ -14,15 +14,38 @@ import { fingerprint } from "./outline.js";
 // Tools that skip auto-dismiss: the dismiss itself (would recurse), and the
 // "pure read / non-interactive" tools where speed matters more than overlay
 // cleanliness. Everything else gets auto-dismiss before execution.
+// Tools that must NOT auto-dismiss before running. These are either:
+//   (a) the dismiss tool itself (recursion), or
+//   (b) read-only / inspection tools where invoking dismissDevOverlay risks
+//       a false-positive tap that modifies app state (e.g. tapping a real
+//       button that happens to live in the bottom 600px and has a desc
+//       matching one of the LogBox badge heuristics).
+// Bottom line: any tool that doesn't already intend to interact with the
+// screen should not be allowed to interact with the screen.
 const SKIP_AUTO_DISMISS = new Set<string>([
   "dismiss_dev_overlay",
+  // Device / session management — never touches the screen.
   "list_devices",
   "select_device",
   "device_info",
+  "current_app",
+  // Pure-read inspection.
+  "screenshot",
+  "outline",
+  "describe",
+  "wait_for_stable",
+  "assert",
+  // Logs / shell / telemetry.
   "get_logcat",
+  "adb_shell",
+  // Recorder + flow management — meta tools, not interactive.
   "recording_status",
   "start_recording",
   "stop_recording",
+  "save_flow",
+  "list_flows",
+  "delete_flow",
+  "send_feedback",
 ]);
 
 // Track consecutive non-batched tool calls. When the agent runs a streak of
