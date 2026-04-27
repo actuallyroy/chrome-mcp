@@ -512,31 +512,60 @@ export const tools: Tool[] = [
   {
     name: "wait_for_stable",
     description:
-      "Wait until the UI tree stops changing (two consecutive snapshots identical). Useful after a click triggers async re-renders. Returns once stable or at the timeout.",
+      "Poll the view-hierarchy XML and return once it stops changing. By default requires 3 consecutive identical snapshots (~750ms of quiet) — bump `stable_polls` if you need higher confidence on screens with mid-load dwell windows. Reports actual elapsed time + poll count so you can verify it really settled.",
     schema: z.object({
-      timeout_ms: z.number().int().min(100).default(3000),
+      timeout_ms: z.number().int().min(100).default(5000),
       poll_ms: z.number().int().min(50).default(250),
+      stable_polls: z
+        .number()
+        .int()
+        .min(1)
+        .default(3)
+        .describe("Number of consecutive identical snapshots required to consider the screen stable. Higher = stricter."),
     }),
     handler: async (args) => {
-      const { timeout_ms, poll_ms } = args as { timeout_ms: number; poll_ms: number };
-      const deadline = Date.now() + timeout_ms;
+      const { timeout_ms, poll_ms, stable_polls: required } = args as {
+        timeout_ms: number;
+        poll_ms: number;
+        stable_polls: number;
+      };
+      const start = Date.now();
+      const deadline = start + timeout_ms;
+      const { dumpSource } = await import("./uiautomator2.js");
       let prev = "";
-      let stable_polls = 0;
+      let consecutive = 0;
+      let polls = 0;
+      let dump_errors = 0;
       while (Date.now() < deadline) {
+        polls++;
         let cur = "";
-        try { cur = await (await import("./uiautomator2.js")).dumpSource(); } catch { cur = ""; }
+        try { cur = await dumpSource(); } catch { dump_errors++; cur = ""; }
         if (cur && cur === prev) {
-          stable_polls++;
-          if (stable_polls >= 1) {
-            return text(`stable`);
+          consecutive++;
+          if (consecutive >= required - 1) {
+            return json({
+              ok: true,
+              status: "stable",
+              ms: Date.now() - start,
+              polls,
+              consecutive_matches: consecutive + 1,
+              dump_errors,
+            });
           }
         } else {
-          stable_polls = 0;
+          consecutive = 0;
         }
         prev = cur;
         await new Promise((r) => setTimeout(r, poll_ms));
       }
-      return text(`timeout`);
+      return json({
+        ok: false,
+        status: "timeout",
+        ms: Date.now() - start,
+        polls,
+        consecutive_matches: consecutive + 1,
+        dump_errors,
+      });
     },
   },
   {
@@ -717,7 +746,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "android",
-          version: "0.1.19",
+          version: "0.1.20",
           context,
         }),
       });
