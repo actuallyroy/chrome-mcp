@@ -343,11 +343,20 @@ const DEV_BADGE_SIGNALS = [
   "⚠️",
 ];
 
-// A content-desc starting with "!," or a digit+comma followed by a space is a
-// strong structural signal of a LogBox-style badge regardless of the message body.
-function looksLikeBadgeDesc(desc: string): boolean {
-  return /^(?:!|⚠️|❌|\d+)\s*,\s/.test(desc);
-}
+// We previously had a structural heuristic ("looksLikeBadgeDesc") that matched
+// any content-desc starting with "<digit>, " on the assumption that LogBox
+// badges encode their count + message that way. That fired on legitimate RN
+// app rows (e.g. "1, , Preparation, " on a numbered activity list), causing
+// dismissDevOverlay to tap real buttons.
+//
+// Since the host app is RN, every distinguishing structural attribute (class,
+// view tree shape, view-group prefix) is shared between LogBox and the app's
+// own views — there is no reliable structural signal in the UiAutomator dump.
+// So we trust only:
+//   1. DEV_BADGE_SIGNALS (substring match on known error/log strings), and
+//   2. The Inspector mode's hardcoded "Dismiss" + "Minimize" pair.
+// If a badge appears with content we don't recognize, the agent can call
+// dismiss_dev_overlay explicitly — better than silently tapping app buttons.
 
 type XmlNode = {
   attrs: Record<string, string>;
@@ -451,7 +460,7 @@ export async function dismissDevOverlay(): Promise<{
         b &&
         desc &&
         b.t >= 1800 && // Badges are pinned near the bottom; avoid false positives mid-screen.
-        (DEV_BADGE_SIGNALS.some((sig) => desc.includes(sig)) || looksLikeBadgeDesc(desc))
+        DEV_BADGE_SIGNALS.some((sig) => desc.includes(sig))
       ) {
         matches.push({ desc, bounds: b });
       }
