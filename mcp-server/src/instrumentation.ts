@@ -80,7 +80,9 @@ export const INSTRUMENTATION_SCRIPT = `
   }
 
   function interactiveElements() {
-    const sel = 'a[href], button, input:not([type="hidden"]), textarea, select, [role="button"], [role="link"], [role="menuitem"], [role="option"], [role="tab"], [role="checkbox"], [role="radio"], [role="switch"], [role="combobox"], [role="textbox"], [role="searchbox"], [role="spinbutton"], [role="slider"]';
+    // Include all <a> (not just a[href]) — frameworks like Next.js Link often
+    // render anchors without href and rely on onClick for client-side routing.
+    const sel = 'a, button, input:not([type="hidden"]), textarea, select, [role="button"], [role="link"], [role="menuitem"], [role="option"], [role="tab"], [role="checkbox"], [role="radio"], [role="switch"], [role="combobox"], [role="textbox"], [role="searchbox"], [role="spinbutton"], [role="slider"]';
     return [...document.querySelectorAll(sel)].filter(isVisible);
   }
 

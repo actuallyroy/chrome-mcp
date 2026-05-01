@@ -61,6 +61,26 @@ async function withPage<T>(fn: (page: Page) => Promise<T>): Promise<T> {
   return fn(page);
 }
 
+// Returns toasts captured by the in-page MutationObserver since `since` (ms epoch).
+// Waits `waitMs` first so observer mutations from the just-completed action have a chance to fire.
+async function toastsSince(page: Page, since: number, waitMs: number): Promise<string[]> {
+  if (waitMs > 0) await new Promise((r) => setTimeout(r, waitMs));
+  return page.evaluate((cutoff: number) => {
+    const w = window as unknown as { __mcp?: { toasts?: { ts: number; text: string }[] } };
+    const arr = w.__mcp?.toasts || [];
+    return arr.filter((t) => t.ts >= cutoff).map((t) => t.text);
+  }, since);
+}
+
+function appendToasts(result: ToolResult, toasts: string[]): ToolResult {
+  if (!toasts.length) return result;
+  const block = `\n\nToasts:\n${toasts.map((t) => `  - ${t}`).join("\n")}`;
+  return {
+    ...result,
+    content: [...result.content, { type: "text", text: block }],
+  };
+}
+
 // Shared locator shape for click/fill. First populated wins.
 const Locator = {
   ref: z.number().int().optional().describe("Ref number from the most recent outline() call"),
@@ -290,20 +310,25 @@ export const tools: Tool[] = [
   {
     name: "click",
     description:
-      "Click an element. Provide one of: ref (from outline), text (visible button/link text), label (form-field label), or selector (CSS fallback).",
+      "Click an element. Provide one of: ref (from outline), text (visible button/link text), label (form-field label), or selector (CSS fallback). Set capture_toast=true to bundle any toast that fires within toast_wait_ms after the click — saves a follow-up get_toasts call.",
     schema: z.object({
       ...Locator,
       button: z.enum(["left", "right", "middle"]).default("left"),
       click_count: z.number().int().min(1).max(3).default(1),
+      capture_toast: z.boolean().default(false),
+      toast_wait_ms: z.number().int().min(0).max(10_000).default(600),
     }),
     handler: async (args) =>
       withPage(async (p) => {
-        const { button, click_count, ...loc } = args as LocatorArgs & {
+        const { button, click_count, capture_toast, toast_wait_ms, ...loc } = args as LocatorArgs & {
           button: "left" | "right" | "middle";
           click_count: number;
+          capture_toast: boolean;
+          toast_wait_ms: number;
         };
         const h = await resolveLocator(p, loc);
         await h.evaluate((el) => (el as HTMLElement).scrollIntoView({ block: "center", behavior: "instant" as ScrollBehavior }));
+        const watermark = Date.now();
         const box = await h.boundingBox();
         if (box) {
           const x = box.x + box.width / 2;
@@ -314,20 +339,36 @@ export const tools: Tool[] = [
         } else {
           await h.click({ button, count: click_count });
         }
-        return text(`clicked (${loc.ref ? `ref=${loc.ref}` : loc.text ? `text="${loc.text}"` : loc.label ? `label="${loc.label}"` : loc.selector})`);
+        const result = text(`clicked (${loc.ref ? `ref=${loc.ref}` : loc.text ? `text="${loc.text}"` : loc.label ? `label="${loc.label}"` : loc.selector})`);
+        if (!capture_toast) return result;
+        const toasts = await toastsSince(p, watermark, toast_wait_ms);
+        return appendToasts(result, toasts);
       }),
   },
   {
     name: "fill",
     description:
-      "Set the value of a form field. Provide one of: ref, label, or selector. Works with native inputs and React-controlled inputs.",
-    schema: z.object({ ...Locator, value: z.string() }),
+      "Set the value of a form field. Provide one of: ref, label, or selector. Works with native inputs and React-controlled inputs. Set capture_toast=true to bundle any toast (e.g. validation error) that fires within toast_wait_ms.",
+    schema: z.object({
+      ...Locator,
+      value: z.string(),
+      capture_toast: z.boolean().default(false),
+      toast_wait_ms: z.number().int().min(0).max(10_000).default(600),
+    }),
     handler: async (args) =>
       withPage(async (p) => {
-        const { value, ...loc } = args as LocatorArgs & { value: string };
+        const { value, capture_toast, toast_wait_ms, ...loc } = args as LocatorArgs & {
+          value: string;
+          capture_toast: boolean;
+          toast_wait_ms: number;
+        };
         const h = await resolveLocator(p, loc);
+        const watermark = Date.now();
         await fillHandle(p, h, value);
-        return text(`filled (${loc.ref ? `ref=${loc.ref}` : loc.label ? `label="${loc.label}"` : loc.selector})`);
+        const result = text(`filled (${loc.ref ? `ref=${loc.ref}` : loc.label ? `label="${loc.label}"` : loc.selector})`);
+        if (!capture_toast) return result;
+        const toasts = await toastsSince(p, watermark, toast_wait_ms);
+        return appendToasts(result, toasts);
       }),
   },
   {
@@ -363,16 +404,23 @@ export const tools: Tool[] = [
   {
     name: "select_option",
     description:
-      "Pick an option in a custom (Radix/shadcn/etc.) combobox. Opens the trigger, waits for options, clicks the one whose text matches.",
+      "Pick an option in a custom (Radix/shadcn/etc.) combobox. Opens the trigger, waits for options, clicks the one whose text matches. Set capture_toast=true to bundle any toast triggered by the selection.",
     schema: z.object({
       ...Locator,
       option: z.string().describe("Text (or substring) of the option to pick"),
+      capture_toast: z.boolean().default(false),
+      toast_wait_ms: z.number().int().min(0).max(10_000).default(600),
     }),
     handler: async (args) =>
       withPage(async (p) => {
-        const { option, ...loc } = args as LocatorArgs & { option: string };
+        const { option, capture_toast, toast_wait_ms, ...loc } = args as LocatorArgs & {
+          option: string;
+          capture_toast: boolean;
+          toast_wait_ms: number;
+        };
         const trigger = await resolveLocator(p, loc);
         await trigger.evaluate((el) => (el as HTMLElement).scrollIntoView({ block: "center", behavior: "instant" as ScrollBehavior }));
+        const watermark = Date.now();
         await trigger.click();
         // Wait for an option to appear (Radix portal renders outside the trigger).
         await p.waitForFunction(
@@ -398,18 +446,33 @@ export const tools: Tool[] = [
             `No option matching "${option}". Visible options: ${JSON.stringify(visible)}`,
           );
         }
-        return text(`picked "${picked}"`);
+        const result = text(`picked "${picked}"`);
+        if (!capture_toast) return result;
+        const toasts = await toastsSince(p, watermark, toast_wait_ms);
+        return appendToasts(result, toasts);
       }),
   },
   {
     name: "press",
-    description: "Press a keyboard key (e.g. 'Enter', 'Tab', 'Escape', 'ArrowDown').",
-    schema: z.object({ key: z.string() }),
+    description: "Press a keyboard key (e.g. 'Enter', 'Tab', 'Escape', 'ArrowDown'). Set capture_toast=true to bundle any toast that fires (e.g. submit-on-Enter triggering a validation toast).",
+    schema: z.object({
+      key: z.string(),
+      capture_toast: z.boolean().default(false),
+      toast_wait_ms: z.number().int().min(0).max(10_000).default(600),
+    }),
     handler: async (args) =>
       withPage(async (p) => {
-        const { key } = args as { key: string };
+        const { key, capture_toast, toast_wait_ms } = args as {
+          key: string;
+          capture_toast: boolean;
+          toast_wait_ms: number;
+        };
+        const watermark = Date.now();
         await p.keyboard.press(key as Parameters<typeof p.keyboard.press>[0]);
-        return text(`Pressed ${key}`);
+        const result = text(`Pressed ${key}`);
+        if (!capture_toast) return result;
+        const toasts = await toastsSince(p, watermark, toast_wait_ms);
+        return appendToasts(result, toasts);
       }),
   },
   {
@@ -459,21 +522,29 @@ export const tools: Tool[] = [
   // ---- Navigation --------------------------------------------------------
   {
     name: "navigate",
-    description: "Navigate the active tab to a URL.",
+    description: "Navigate the active tab to a URL. Set capture_toast=true to bundle any toast that fires after the page loads (default wait is longer here).",
     schema: z.object({
       url: z.string().url(),
       wait_until: z
         .enum(["load", "domcontentloaded", "networkidle0", "networkidle2"])
         .default("domcontentloaded"),
+      capture_toast: z.boolean().default(false),
+      toast_wait_ms: z.number().int().min(0).max(10_000).default(1000),
     }),
     handler: async (args) =>
       withPage(async (p) => {
-        const { url, wait_until } = args as {
+        const { url, wait_until, capture_toast, toast_wait_ms } = args as {
           url: string;
           wait_until: "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
+          capture_toast: boolean;
+          toast_wait_ms: number;
         };
+        const watermark = Date.now();
         await p.goto(url, { waitUntil: wait_until });
-        return text(`Navigated to ${p.url()}`);
+        const result = text(`Navigated to ${p.url()}`);
+        if (!capture_toast) return result;
+        const toasts = await toastsSince(p, watermark, toast_wait_ms);
+        return appendToasts(result, toasts);
       }),
   },
   {
