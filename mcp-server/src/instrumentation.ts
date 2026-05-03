@@ -83,7 +83,23 @@ export const INSTRUMENTATION_SCRIPT = `
     // Include all <a> (not just a[href]) — frameworks like Next.js Link often
     // render anchors without href and rely on onClick for client-side routing.
     const sel = 'a, button, input:not([type="hidden"]), textarea, select, [role="button"], [role="link"], [role="menuitem"], [role="option"], [role="tab"], [role="checkbox"], [role="radio"], [role="switch"], [role="combobox"], [role="textbox"], [role="searchbox"], [role="spinbutton"], [role="slider"]';
-    return [...document.querySelectorAll(sel)].filter(isVisible);
+    const explicit = [...document.querySelectorAll(sel)].filter(isVisible);
+    // Also surface "card-style" clickables: divs/spans/etc with cursor:pointer
+    // and a React onClick listener (no href, no role). Common in shadcn/Radix
+    // wizards. We can't introspect React listeners, but cursor:pointer is the
+    // styling tell — apps explicitly set it on click targets.
+    const explicitSet = new Set(explicit);
+    const cursorPointer = [...document.querySelectorAll('div, span, li, article, section, label')].filter((el) => {
+      if (explicitSet.has(el)) return false;
+      if (!isVisible(el)) return false;
+      if (getComputedStyle(el).cursor !== 'pointer') return false;
+      // Skip if a descendant is already an interactive element with the same
+      // bounding rect — avoids duplicating a card AND its inner button.
+      const inner = el.querySelector(sel);
+      if (inner && explicitSet.has(inner)) return false;
+      return true;
+    });
+    return [...explicit, ...cursorPointer];
   }
 
   function findByText(text, roleHint) {

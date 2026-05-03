@@ -264,11 +264,32 @@ async function u2Inner(
   isRetry: boolean,
 ): Promise<unknown> {
   const sid = await ensureSession();
-  const r = await fetch(`http://127.0.0.1:${localPort}/wd/hub/session/${sid}${path}`, {
-    method,
-    headers: body ? { "content-type": "application/json" } : undefined,
-    body: body == null ? undefined : JSON.stringify(body),
-  });
+  let r: Response;
+  try {
+    r = await fetch(`http://127.0.0.1:${localPort}/wd/hub/session/${sid}${path}`, {
+      method,
+      headers: body ? { "content-type": "application/json" } : undefined,
+      body: body == null ? undefined : JSON.stringify(body),
+    });
+  } catch (e) {
+    // Transport-level failures: UIAutomator2 server crashed, port forward
+    // dropped, instrumentation got killed (e.g. by Maestro stealing the
+    // UiAutomation slot), TCP RST, etc. Node throws "TypeError: fetch failed"
+    // with the real cause buried in `.cause`. Tear down and rebuild once,
+    // mirroring the stale-session path — without this the user has to
+    // /mcp reconnect from outside (issue #7).
+    if (!isRetry) {
+      const cause = (e as { cause?: { code?: string; message?: string } }).cause;
+      log(`u2 transport error (${cause?.code || (e as Error).message}), rebuilding session`);
+      await teardownSession();
+      return u2Inner(method, path, body, true);
+    }
+    const cause = (e as { cause?: { code?: string; message?: string } }).cause;
+    throw new Error(
+      `u2 ${method} ${path}: transport dropped and rebuild failed — ${cause?.code || (e as Error).message}. ` +
+        `Try again, or /mcp reconnect if it persists.`,
+    );
+  }
   const text = await r.text();
   let parsed: unknown = null;
   try { parsed = text ? JSON.parse(text) : null; } catch { parsed = text; }
