@@ -4,12 +4,73 @@ import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import puppeteer, { Browser, Page } from "puppeteer-core";
 import { INSTRUMENTATION_SCRIPT } from "./instrumentation.js";
+import {
+  SESSION_ID,
+  acquireLock,
+  formatOwner,
+  installCleanup,
+  releaseLock,
+  setHeartbeatTarget,
+  verifyLock,
+} from "./tab-lock.js";
 
 const DEFAULT_PORT = Number(process.env.CHROME_DEBUG_PORT ?? 9222);
 const DEFAULT_HOST = process.env.CHROME_DEBUG_HOST ?? "127.0.0.1";
 
 let browser: Browser | null = null;
 let activePage: Page | null = null;
+let activeTargetId: string | null = null;
+
+export function getCdpPort(): number {
+  return DEFAULT_PORT;
+}
+
+const targetIdCache = new WeakMap<Page, string>();
+
+async function targetIdFor(page: Page): Promise<string> {
+  const cached = targetIdCache.get(page);
+  if (cached) return cached;
+  // Prefer CDP query — `Target._targetId` is internal in puppeteer-core and
+  // varies across versions. `Target.getTargetInfo` is part of the protocol.
+  const cdp = await page.createCDPSession();
+  try {
+    const { targetInfo } = (await cdp.send("Target.getTargetInfo")) as {
+      targetInfo: { targetId: string };
+    };
+    targetIdCache.set(page, targetInfo.targetId);
+    return targetInfo.targetId;
+  } finally {
+    try { await cdp.detach(); } catch { /* ignore */ }
+  }
+}
+
+async function claimPage(page: Page, force = false): Promise<void> {
+  installCleanup();
+  const targetId = await targetIdFor(page);
+  const url = page.url();
+  const result = acquireLock(DEFAULT_PORT, targetId, url, force);
+  if (!result.ok) {
+    throw new Error(
+      `Tab is locked by another chrome-mcp session (${formatOwner(result.owner)}). ` +
+        `Two Claude Code sessions can't safely drive the same tab. ` +
+        `Use a different tab via select_tab, or pass force=true to take_tab to override.`,
+    );
+  }
+  // Release the previous tab's lock if we owned one, so it's free for others.
+  if (activeTargetId && activeTargetId !== targetId) {
+    releaseLock(DEFAULT_PORT, activeTargetId);
+  }
+  activeTargetId = targetId;
+  setHeartbeatTarget({ port: DEFAULT_PORT, targetId });
+}
+
+export function getActiveTargetId(): string | null {
+  return activeTargetId;
+}
+
+export function getSessionId(): string {
+  return SESSION_ID;
+}
 
 function findChromeBinary(): string | null {
   if (process.env.CHROME_BIN && existsSync(process.env.CHROME_BIN)) {
@@ -152,6 +213,11 @@ export async function getBrowser(): Promise<Browser> {
   browser.on("disconnected", () => {
     browser = null;
     activePage = null;
+    if (activeTargetId) {
+      releaseLock(DEFAULT_PORT, activeTargetId);
+      activeTargetId = null;
+    }
+    setHeartbeatTarget(null);
   });
   browser.on("targetcreated", async (target) => {
     try {
@@ -178,6 +244,17 @@ export async function listPages(): Promise<Page[]> {
 
 export async function getActivePage(): Promise<Page> {
   if (activePage && !activePage.isClosed()) {
+    // Re-verify the lock — another session may have force-taken the tab.
+    if (activeTargetId) {
+      const v = verifyLock(DEFAULT_PORT, activeTargetId);
+      if (!v.ok) {
+        const ownerInfo = v.reason === "taken" && v.owner ? ` (now owned by ${formatOwner(v.owner)})` : "";
+        throw new Error(
+          `Lost lock on the active tab${ownerInfo}. Re-select a tab with select_tab, ` +
+            `or take_tab { force: true } to reclaim it.`,
+        );
+      }
+    }
     await ensureInstrumentation(activePage);
     return activePage;
   }
@@ -187,26 +264,27 @@ export async function getActivePage(): Promise<Page> {
     activePage = await b.newPage();
     await attachInstrumentation(activePage);
     await ensureInstrumentation(activePage);
+    await claimPage(activePage);
     return activePage;
   }
+  // Prefer the focused tab, then the first un-locked tab, then page[0].
+  let focused: Page | null = null;
   for (const p of pages) {
     try {
-      const focused = await p.evaluate(() => document.hasFocus());
-      if (focused) {
-        activePage = p;
-        await ensureInstrumentation(activePage);
-        return p;
+      if (await p.evaluate(() => document.hasFocus())) {
+        focused = p;
+        break;
       }
-    } catch {
-      // page may have navigated/closed — skip
-    }
+    } catch { /* page may have navigated/closed — skip */ }
   }
-  activePage = pages[0];
+  const candidate = focused || pages[0];
+  activePage = candidate;
   await ensureInstrumentation(activePage);
+  await claimPage(activePage);
   return activePage;
 }
 
-export async function selectPageByIndex(index: number): Promise<Page> {
+export async function selectPageByIndex(index: number, force = false): Promise<Page> {
   const pages = await listPages();
   if (index < 0 || index >= pages.length) {
     throw new Error(`Tab index ${index} out of range (have ${pages.length} tabs)`);
@@ -214,19 +292,32 @@ export async function selectPageByIndex(index: number): Promise<Page> {
   activePage = pages[index];
   await activePage.bringToFront();
   await ensureInstrumentation(activePage);
+  await claimPage(activePage, force);
   return activePage;
 }
 
-export async function selectPageByUrlSubstring(match: string): Promise<Page> {
+export async function selectPageByUrlSubstring(match: string, force = false): Promise<Page> {
   const pages = await listPages();
   const found = pages.find((p) => p.url().includes(match));
   if (!found) throw new Error(`No tab whose URL contains "${match}"`);
   activePage = found;
   await activePage.bringToFront();
   await ensureInstrumentation(activePage);
+  await claimPage(activePage, force);
   return activePage;
 }
 
 export function setActivePage(page: Page) {
   activePage = page;
+  // Caller is responsible for claimPage — kept here for back-compat.
+}
+
+export async function claimActivePage(force = false): Promise<void> {
+  if (!activePage || activePage.isClosed()) {
+    const pages = await listPages();
+    if (pages.length === 0) throw new Error("No tab open to claim.");
+    activePage = pages[0];
+    await ensureInstrumentation(activePage);
+  }
+  await claimPage(activePage, force);
 }

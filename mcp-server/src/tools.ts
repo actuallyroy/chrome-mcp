@@ -25,14 +25,17 @@ function resizePngBase64(b64: string, maxDim: number): string {
   return PNG.sync.write(dst).toString("base64");
 }
 import {
+  claimActivePage,
   getActivePage,
   getBrowser,
+  getCdpPort,
   launchChrome,
   listPages,
   selectPageByIndex,
   selectPageByUrlSubstring,
   setActivePage,
 } from "./browser.js";
+import { formatOwner, listFreshLocks } from "./tab-lock.js";
 import { readFileSync } from "node:fs";
 import {
   getRecentCalls,
@@ -632,34 +635,63 @@ export const tools: Tool[] = [
   // ---- Tab control -------------------------------------------------------
   {
     name: "list_tabs",
-    description: "List open tabs. Returns index, url, title for each.",
+    description: "List open tabs with their lock status. Each tab shows {index, url, title, locked_by} where locked_by names the chrome-mcp session that owns it (if any).",
     schema: z.object({}),
     handler: async () => {
       const pages = await listPages();
+      const locks = listFreshLocks();
+      const port = getCdpPort();
+      // Map page → targetId via CDP so we can correlate to lock entries.
       const info = await Promise.all(
-        pages.map(async (p, i) => ({
-          index: i,
-          url: p.url(),
-          title: await p.title().catch(() => ""),
-        })),
+        pages.map(async (p, i) => {
+          let targetId: string | null = null;
+          try {
+            const cdp = await p.createCDPSession();
+            const { targetInfo } = (await cdp.send("Target.getTargetInfo")) as { targetInfo: { targetId: string } };
+            targetId = targetInfo.targetId;
+            await cdp.detach().catch(() => {});
+          } catch { /* ignore */ }
+          const lock = targetId ? locks[`${port}:${targetId}`] : undefined;
+          return {
+            index: i,
+            url: p.url(),
+            title: await p.title().catch(() => ""),
+            locked_by: lock ? formatOwner(lock) : null,
+          };
+        }),
       );
       return json(info);
     },
   },
   {
     name: "select_tab",
-    description: "Make a tab active. Provide index (from list_tabs) or url_contains (substring).",
+    description: "Make a tab active. Provide index (from list_tabs) or url_contains (substring). Fails if another chrome-mcp session has claimed the tab — pass force=true to override.",
     schema: z.object({
       index: z.number().int().optional(),
       url_contains: z.string().optional(),
+      force: z.boolean().default(false),
     }),
     handler: async (args) => {
-      const { index, url_contains } = args as { index?: number; url_contains?: string };
+      const { index, url_contains, force } = args as {
+        index?: number;
+        url_contains?: string;
+        force: boolean;
+      };
       let page: Page;
-      if (typeof index === "number") page = await selectPageByIndex(index);
-      else if (url_contains) page = await selectPageByUrlSubstring(url_contains);
+      if (typeof index === "number") page = await selectPageByIndex(index, force);
+      else if (url_contains) page = await selectPageByUrlSubstring(url_contains, force);
       else throw new Error("Provide either 'index' or 'url_contains'");
       return text(`Active tab: ${page.url()}`);
+    },
+  },
+  {
+    name: "take_tab",
+    description: "Forcibly claim the currently-active tab even if another chrome-mcp session owns it. Use when list_tabs shows a stale lock or you intentionally want to take over.",
+    schema: z.object({}),
+    handler: async () => {
+      await claimActivePage(true);
+      const p = await getActivePage();
+      return text(`Took tab: ${p.url()}`);
     },
   },
   {
@@ -673,6 +705,7 @@ export const tools: Tool[] = [
       if (url) await page.goto(url, { waitUntil: "domcontentloaded" });
       setActivePage(page);
       await page.bringToFront();
+      await claimActivePage();
       return text(`Opened ${page.url()}`);
     },
   },
