@@ -25,7 +25,9 @@ function resizePngBase64(b64: string, maxDim: number): string {
   return PNG.sync.write(dst).toString("base64");
 }
 import {
+  armNextDialog,
   claimActivePage,
+  dialogsSince,
   getActivePage,
   getBrowser,
   getCdpPort,
@@ -78,6 +80,22 @@ async function toastsSince(page: Page, since: number, waitMs: number): Promise<s
 function appendToasts(result: ToolResult, toasts: string[]): ToolResult {
   if (!toasts.length) return result;
   const block = `\n\nToasts:\n${toasts.map((t) => `  - ${t}`).join("\n")}`;
+  return {
+    ...result,
+    content: [...result.content, { type: "text", text: block }],
+  };
+}
+
+function appendDialogs(
+  result: ToolResult,
+  dialogs: { type: string; message: string; action: string; returned?: string }[],
+): ToolResult {
+  if (!dialogs.length) return result;
+  const lines = dialogs.map((d) => {
+    const ret = d.returned !== undefined ? ` → "${d.returned}"` : "";
+    return `  - ${d.type}: "${d.message}" [${d.action}]${ret}`;
+  });
+  const block = `\n\nDialogs (auto-handled):\n${lines.join("\n")}`;
   return {
     ...result,
     content: [...result.content, { type: "text", text: block }],
@@ -313,25 +331,38 @@ export const tools: Tool[] = [
   {
     name: "click",
     description:
-      "Click an element. Provide one of: ref (from outline), text (visible button/link text), label (form-field label), or selector (CSS fallback). Set capture_toast=true to bundle any toast that fires within toast_wait_ms after the click — saves a follow-up get_toasts call.",
+      "Click an element. Provide one of: ref (from outline), text (visible button/link text), label (form-field label), or selector (CSS fallback). Native JS dialogs (alert/confirm/prompt) are auto-accepted by default — set dialog_action=\"dismiss\" to cancel the next dialog instead, or prompt_text to supply a value to a prompt(). Captured dialogs are appended to the result. Set capture_toast=true to also bundle toasts.",
     schema: z.object({
       ...Locator,
       button: z.enum(["left", "right", "middle"]).default("left"),
       click_count: z.number().int().min(1).max(3).default(1),
       capture_toast: z.boolean().default(false),
       toast_wait_ms: z.number().int().min(0).max(10_000).default(600),
+      dialog_action: z.enum(["accept", "dismiss"]).default("accept"),
+      prompt_text: z.string().optional(),
     }),
     handler: async (args) =>
       withPage(async (p) => {
-        const { button, click_count, capture_toast, toast_wait_ms, ...loc } = args as LocatorArgs & {
+        const {
+          button, click_count, capture_toast, toast_wait_ms,
+          dialog_action, prompt_text, ...loc
+        } = args as LocatorArgs & {
           button: "left" | "right" | "middle";
           click_count: number;
           capture_toast: boolean;
           toast_wait_ms: number;
+          dialog_action: "accept" | "dismiss";
+          prompt_text?: string;
         };
         const h = await resolveLocator(p, loc);
         await h.evaluate((el) => (el as HTMLElement).scrollIntoView({ block: "center", behavior: "instant" as ScrollBehavior }));
         const watermark = Date.now();
+        // Arm the dialog handler for whatever the click triggers. Default is
+        // already "accept", so we only re-arm explicitly when the agent wants
+        // dismiss or a specific prompt value.
+        if (dialog_action === "dismiss" || prompt_text !== undefined) {
+          armNextDialog(p, dialog_action, prompt_text);
+        }
         const box = await h.boundingBox();
         if (box) {
           const x = box.x + box.width / 2;
@@ -342,10 +373,16 @@ export const tools: Tool[] = [
         } else {
           await h.click({ button, count: click_count });
         }
-        const result = text(`clicked (${loc.ref ? `ref=${loc.ref}` : loc.text ? `text="${loc.text}"` : loc.label ? `label="${loc.label}"` : loc.selector})`);
-        if (!capture_toast) return result;
-        const toasts = await toastsSince(p, watermark, toast_wait_ms);
-        return appendToasts(result, toasts);
+        // Brief wait so a sync confirm() the click triggered has time to fire
+        // and be auto-handled before we sample dialogsSince.
+        await new Promise((r) => setTimeout(r, 100));
+        let result = text(`clicked (${loc.ref ? `ref=${loc.ref}` : loc.text ? `text="${loc.text}"` : loc.label ? `label="${loc.label}"` : loc.selector})`);
+        result = appendDialogs(result, dialogsSince(p, watermark));
+        if (capture_toast) {
+          const toasts = await toastsSince(p, watermark, toast_wait_ms);
+          result = appendToasts(result, toasts);
+        }
+        return result;
       }),
   },
   {
@@ -368,10 +405,13 @@ export const tools: Tool[] = [
         const h = await resolveLocator(p, loc);
         const watermark = Date.now();
         await fillHandle(p, h, value);
-        const result = text(`filled (${loc.ref ? `ref=${loc.ref}` : loc.label ? `label="${loc.label}"` : loc.selector})`);
-        if (!capture_toast) return result;
-        const toasts = await toastsSince(p, watermark, toast_wait_ms);
-        return appendToasts(result, toasts);
+        let result = text(`filled (${loc.ref ? `ref=${loc.ref}` : loc.label ? `label="${loc.label}"` : loc.selector})`);
+        result = appendDialogs(result, dialogsSince(p, watermark));
+        if (capture_toast) {
+          const toasts = await toastsSince(p, watermark, toast_wait_ms);
+          result = appendToasts(result, toasts);
+        }
+        return result;
       }),
   },
   {
@@ -449,10 +489,14 @@ export const tools: Tool[] = [
             `No option matching "${option}". Visible options: ${JSON.stringify(visible)}`,
           );
         }
-        const result = text(`picked "${picked}"`);
-        if (!capture_toast) return result;
-        const toasts = await toastsSince(p, watermark, toast_wait_ms);
-        return appendToasts(result, toasts);
+        let result = text(`picked "${picked}"`);
+        await new Promise((r) => setTimeout(r, 100));
+        result = appendDialogs(result, dialogsSince(p, watermark));
+        if (capture_toast) {
+          const toasts = await toastsSince(p, watermark, toast_wait_ms);
+          result = appendToasts(result, toasts);
+        }
+        return result;
       }),
   },
   {
@@ -472,10 +516,14 @@ export const tools: Tool[] = [
         };
         const watermark = Date.now();
         await p.keyboard.press(key as Parameters<typeof p.keyboard.press>[0]);
-        const result = text(`Pressed ${key}`);
-        if (!capture_toast) return result;
-        const toasts = await toastsSince(p, watermark, toast_wait_ms);
-        return appendToasts(result, toasts);
+        await new Promise((r) => setTimeout(r, 100));
+        let result = text(`Pressed ${key}`);
+        result = appendDialogs(result, dialogsSince(p, watermark));
+        if (capture_toast) {
+          const toasts = await toastsSince(p, watermark, toast_wait_ms);
+          result = appendToasts(result, toasts);
+        }
+        return result;
       }),
   },
   {
@@ -544,10 +592,13 @@ export const tools: Tool[] = [
         };
         const watermark = Date.now();
         await p.goto(url, { waitUntil: wait_until });
-        const result = text(`Navigated to ${p.url()}`);
-        if (!capture_toast) return result;
-        const toasts = await toastsSince(p, watermark, toast_wait_ms);
-        return appendToasts(result, toasts);
+        let result = text(`Navigated to ${p.url()}`);
+        result = appendDialogs(result, dialogsSince(p, watermark));
+        if (capture_toast) {
+          const toasts = await toastsSince(p, watermark, toast_wait_ms);
+          result = appendToasts(result, toasts);
+        }
+        return result;
       }),
   },
   {

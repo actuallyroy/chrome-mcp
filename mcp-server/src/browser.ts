@@ -165,6 +165,60 @@ export async function launchChrome(opts: { headless?: boolean } = {}): Promise<{
   );
 }
 
+// Native JS dialogs (alert/confirm/prompt) block CDP — every click that triggers
+// one would hang until protocolTimeout. Auto-accept by default (returns true for
+// confirm, OK for alert, default-or-empty value for prompt) and record what we
+// did so action tools can surface it to the agent.
+type DialogEntry = {
+  ts: number;
+  type: string;       // alert | confirm | prompt | beforeunload
+  message: string;
+  action: "accepted" | "dismissed";
+  returned?: string;  // for prompt
+};
+const dialogBuffers = new WeakMap<Page, DialogEntry[]>();
+// One-shot override for the next dialog: { action: "dismiss" } makes the next
+// dialog get cancelled instead of accepted. Cleared after the next dialog fires.
+const nextDialogMode = new WeakMap<Page, { action: "accept" | "dismiss"; text?: string }>();
+
+function attachDialogHandler(page: Page) {
+  if (dialogBuffers.has(page)) return;
+  dialogBuffers.set(page, []);
+  page.on("dialog", async (dialog) => {
+    const override = nextDialogMode.get(page);
+    nextDialogMode.delete(page);
+    const action = override?.action || "accept";
+    const promptText = override?.text ?? dialog.defaultValue() ?? "";
+    const entry: DialogEntry = {
+      ts: Date.now(),
+      type: dialog.type(),
+      message: dialog.message(),
+      action: action === "accept" ? "accepted" : "dismissed",
+      returned: dialog.type() === "prompt" && action === "accept" ? promptText : undefined,
+    };
+    try {
+      if (action === "accept") {
+        if (dialog.type() === "prompt") await dialog.accept(promptText);
+        else await dialog.accept();
+      } else {
+        await dialog.dismiss();
+      }
+    } catch { /* CDP closed, etc. */ }
+    const buf = dialogBuffers.get(page) || [];
+    buf.push(entry);
+    if (buf.length > 200) buf.shift();
+    dialogBuffers.set(page, buf);
+  });
+}
+
+export function dialogsSince(page: Page, since: number): DialogEntry[] {
+  return (dialogBuffers.get(page) || []).filter((d) => d.ts >= since);
+}
+
+export function armNextDialog(page: Page, action: "accept" | "dismiss", text?: string) {
+  nextDialogMode.set(page, { action, text });
+}
+
 async function attachInstrumentation(page: Page) {
   // Re-install on every new document so refs/toast watcher survive navigations.
   try {
@@ -172,6 +226,7 @@ async function attachInstrumentation(page: Page) {
   } catch {
     // some CDP targets don't support this; fall back to per-call injection
   }
+  attachDialogHandler(page);
 }
 
 export async function ensureInstrumentation(page: Page) {
