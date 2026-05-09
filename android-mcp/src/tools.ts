@@ -35,6 +35,19 @@ import {
   setElementValue,
   u2,
 } from "./uiautomator2.js";
+import { installAdb } from "./install-adb.js";
+import {
+  ensureSqlite3,
+  isWriteQuery,
+  listDatabases,
+  listDebuggablePackages,
+  listTables,
+  pullDatabase,
+  searchDatabases,
+  sqliteExec,
+  sqliteQuery,
+  tableSchema,
+} from "./sqlite.js";
 
 export type ToolResult = {
   content: { type: "text" | "image"; text?: string; data?: string; mimeType?: string }[];
@@ -61,9 +74,12 @@ const RUN_SCRIPT_INTERACTIVE = new Set<string>([
 ]);
 const RUN_SCRIPT_SKIP_AUTO_DISMISS = new Set<string>([
   "dismiss_dev_overlay",
+  "install_adb",
   "list_devices", "select_device", "device_info", "current_app",
   "screenshot", "outline", "describe", "wait_for_stable", "assert",
   "get_logcat", "adb_shell",
+  "sqlite_list_packages", "sqlite_list_databases", "sqlite_list_tables",
+  "sqlite_table_schema", "sqlite_query", "sqlite_pull_db", "sqlite_check",
   "recording_status", "start_recording", "stop_recording",
   "save_flow", "list_flows", "delete_flow",
   "send_feedback",
@@ -177,6 +193,15 @@ export async function runSteps(
 
 export const tools: Tool[] = [
   // ---- Device lifecycle --------------------------------------------------
+  {
+    name: "install_adb",
+    description:
+      "Download Android platform-tools (~13 MB) from dl.google.com and install adb into the android-mcp cache dir (~/.android-mcp/platform-tools). " +
+      "USE THIS ONLY WITH USER PERMISSION — confirm with the user first, since it triggers an external network download. " +
+      "After it returns, subsequent tool calls will pick up the cached adb automatically.",
+    schema: z.object({}),
+    handler: async () => json(await installAdb()),
+  },
   {
     name: "list_devices",
     description: "List connected Android devices/emulators with their state.",
@@ -618,6 +643,120 @@ export const tools: Tool[] = [
     },
   },
 
+  // ---- SQLite (debuggable apps) ------------------------------------------
+  // Inspect/query SQLite databases inside the app sandbox. Uses
+  // `adb shell run-as <pkg>` against a sqlite3 binary already on the device
+  // (system path, /data/local/tmp/sqlite3, or app-local copy). Only works
+  // for debuggable builds; release APKs reject run-as.
+  {
+    name: "sqlite_list_packages",
+    description: "List packages on the device that allow run-as access (typically debuggable third-party apps). These are the packages whose SQLite databases sqlite_* tools can inspect.",
+    schema: z.object({}),
+    handler: async () => {
+      await ensureDevice();
+      return json(await listDebuggablePackages());
+    },
+  },
+  {
+    name: "sqlite_list_databases",
+    description: "List SQLite database files inside an app's sandbox (databases/, files/, files/SQLite/, no_backup/). Returns name + path-within-sandbox; pass that path to other sqlite_* tools.",
+    schema: z.object({
+      package: z.string(),
+      search: z.string().optional().describe("If set, do a recursive `find` instead of checking the standard locations, and substring-filter results."),
+    }),
+    handler: async (args) => {
+      await ensureDevice();
+      const { package: pkg, search } = args as { package: string; search?: string };
+      const dbs = search !== undefined ? await searchDatabases(pkg, search) : await listDatabases(pkg);
+      return json(dbs);
+    },
+  },
+  {
+    name: "sqlite_list_tables",
+    description: "List user tables in a SQLite database (excludes sqlite_* internals).",
+    schema: z.object({
+      package: z.string(),
+      db: z.string().describe("Database name or path-within-sandbox (from sqlite_list_databases)."),
+    }),
+    handler: async (args) => {
+      await ensureDevice();
+      const { package: pkg, db } = args as { package: string; db: string };
+      return json(await listTables(pkg, db));
+    },
+  },
+  {
+    name: "sqlite_table_schema",
+    description: "Return PRAGMA table_info for a table (cid, name, type, notnull, dflt_value, pk).",
+    schema: z.object({
+      package: z.string(),
+      db: z.string(),
+      table: z.string(),
+    }),
+    handler: async (args) => {
+      await ensureDevice();
+      const { package: pkg, db, table } = args as { package: string; db: string; table: string };
+      return json(await tableSchema(pkg, db, table));
+    },
+  },
+  {
+    name: "sqlite_query",
+    description:
+      "Run a SQL query against a database. SELECT returns rows as JSON; INSERT/UPDATE/DELETE/CREATE/ALTER/DROP/REPLACE execute and return {ok}. " +
+      "Auto-appends `LIMIT <limit>` to bare SELECTs. Set allow_write=true to permit write statements.",
+    schema: z.object({
+      package: z.string(),
+      db: z.string(),
+      sql: z.string(),
+      limit: z.number().int().min(1).max(10_000).default(200),
+      allow_write: z.boolean().default(false),
+    }),
+    handler: async (args) => {
+      await ensureDevice();
+      const { package: pkg, db, sql, limit, allow_write } = args as {
+        package: string; db: string; sql: string; limit: number; allow_write: boolean;
+      };
+      const trimmed = sql.trim().replace(/;\s*$/, "");
+      if (isWriteQuery(trimmed)) {
+        if (!allow_write) throw new Error("Write statement detected. Pass allow_write: true to execute.");
+        const out = await sqliteExec(pkg, db, trimmed);
+        return json({ ok: true, output: out });
+      }
+      let finalSql = trimmed;
+      if (/^select\b/i.test(trimmed) && !/\blimit\b/i.test(trimmed)) {
+        finalSql = `${trimmed} LIMIT ${limit}`;
+      }
+      const rows = await sqliteQuery(pkg, db, finalSql);
+      const columns = rows.length ? Object.keys(rows[0]) : [];
+      return json({ columns, rows, row_count: rows.length });
+    },
+  },
+  {
+    name: "sqlite_pull_db",
+    description: "Copy a database file out of an app's sandbox to the host filesystem (so you can open it in DB Browser for SQLite, etc.). Stages via /data/local/tmp.",
+    schema: z.object({
+      package: z.string(),
+      db: z.string(),
+      dest: z.string().describe("Absolute path on the host machine to write the .db file to."),
+    }),
+    handler: async (args) => {
+      await ensureDevice();
+      const { package: pkg, db, dest } = args as { package: string; db: string; dest: string };
+      const r = await pullDatabase(pkg, db, dest);
+      return json({ ok: true, dest, size: r.size });
+    },
+  },
+  {
+    name: "sqlite_check",
+    description: "Verify sqlite3 binary is reachable for a package and report the resolved path. Useful when sqlite_query fails with 'sqlite3 not found'.",
+    schema: z.object({ package: z.string() }),
+    handler: async (args) => {
+      await ensureDevice();
+      const { package: pkg } = args as { package: string };
+      const path = await ensureSqlite3(pkg);
+      return json({ ok: true, sqlite3_path: path });
+    },
+  },
+
   // ---- Debug pause (MVP: stderr + flag-file) -----------------------------
   {
     name: "pause",
@@ -746,7 +885,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "android",
-          version: "0.1.21",
+          version: "0.1.23",
           context,
         }),
       });

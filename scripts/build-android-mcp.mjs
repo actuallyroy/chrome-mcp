@@ -82,6 +82,19 @@ const testApkUrl = `https://github.com/appium/appium-uiautomator2-server/release
 const mainBytes = await ensureApk("uiautomator2-server.apk", mainApkUrl);
 const testBytes = await ensureApk("uiautomator2-server-test.apk", testApkUrl);
 
+// Copy vendored sqlite3-arm64 (from amitwinit/SQLite-DevTools-Mobile-ReactNative)
+// so the loader can fetch it on demand.
+const sqliteSrc = join(MCP_DIR, "vendor", "sqlite3-arm64");
+const sqliteDest = join(VENDOR_DIR, "sqlite3-arm64");
+let sqliteBytes = null;
+if (existsSync(sqliteSrc)) {
+  copyFileSync(sqliteSrc, sqliteDest);
+  sqliteBytes = readFileSync(sqliteDest);
+  console.log(`vendor/sqlite3-arm64 copied (${(sqliteBytes.length / 1024).toFixed(0)} KB)`);
+} else {
+  console.warn(`WARN: ${sqliteSrc} not found — sqlite3 will not be available via the loader`);
+}
+
 // 4. Manifest.
 const manifest = {
   product: "android-mcp",
@@ -103,6 +116,14 @@ const manifest = {
       size_bytes: testBytes.length,
     },
   },
+  sqlite3: sqliteBytes
+    ? {
+        arch: "arm64",
+        url: "/android/vendor/sqlite3-arm64",
+        sha256: createHash("sha256").update(sqliteBytes).digest("hex"),
+        size_bytes: sqliteBytes.length,
+      }
+    : null,
 };
 writeFileSync(join(BUNDLE_DIR, "manifest.json"), JSON.stringify(manifest, null, 2));
 

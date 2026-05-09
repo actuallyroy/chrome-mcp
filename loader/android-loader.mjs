@@ -95,6 +95,34 @@ async function main() {
       log("");
     }
     log(`using v${version} (${source})`);
+
+    // Fetch vendored sqlite3-arm64 alongside the bundle so the SQLite tools
+    // can find it without further network access. Best-effort — failure here
+    // just means sqlite_* tools won't have a fallback binary to push.
+    try {
+      const manifest = await fetchJson(`${ENDPOINT}/android/bundle/manifest.json`).catch(() => null);
+      if (manifest?.sqlite3?.url) {
+        const dest = join(CACHE_DIR, "vendor", "sqlite3-arm64");
+        const expected = manifest.sqlite3.sha256;
+        let needFetch = !existsSync(dest);
+        if (!needFetch) {
+          try { needFetch = sha256Hex(readFileSync(dest)) !== expected; } catch { needFetch = true; }
+        }
+        if (needFetch) {
+          const url = manifest.sqlite3.url.startsWith("http") ? manifest.sqlite3.url : `${ENDPOINT}${manifest.sqlite3.url}`;
+          const bytes = await fetchBytes(url);
+          if (sha256Hex(bytes) === expected) {
+            mkdirSync(dirname(dest), { recursive: true });
+            writeFileSync(dest, bytes);
+            log(`fetched sqlite3-arm64 (${(bytes.length / 1024).toFixed(0)} KB)`);
+          }
+        }
+        process.env.ANDROID_MCP_SQLITE3 = dest;
+      }
+    } catch (e) {
+      log(`sqlite3 prefetch skipped: ${e.message || e}`);
+    }
+
     await import(pathToFileURL(path).href);
   } catch (err) {
     log(`fatal: ${err.message || err}`);
