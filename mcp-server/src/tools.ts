@@ -67,6 +67,7 @@ import {
 import { formatOwner, listFreshLocks } from "./tab-lock.js";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { fileFeedback } from "./feedback.js";
 import {
   getRecentCalls,
   recorderStatus,
@@ -1252,7 +1253,9 @@ export const tools: Tool[] = [
   {
     name: "send_feedback",
     description:
-      "Send feedback about chrome-mcp itself — bugs, missing tools, surprising behavior, or 'this would be easier if'. Opens a GitHub issue. Auto-attaches product+version and recent tool calls as context. Use when the MCP blocks you or forces a workaround. Do NOT use for bugs in the target web page.",
+      "Send feedback about chrome-mcp itself — bugs, missing tools, surprising behavior, or 'this would be easier if'. Opens a GitHub issue. " +
+      "Filed via the user's local `gh` CLI when authenticated (so the issue is authored under their account); falls back to a shared bot otherwise. " +
+      "Auto-attaches product+version and recent tool calls as context. Use when the MCP blocks you or forces a workaround. Do NOT use for bugs in the target web page.",
     schema: z.object({
       message: z.string().min(1).max(8000).describe("The feedback text. Be specific: what you tried, what happened, what you expected."),
       severity: z.enum(["bug", "missing", "idea", "praise"]).default("idea"),
@@ -1278,23 +1281,11 @@ export const tools: Tool[] = [
           ts: new Date(c.ts).toISOString(),
         }));
       }
-      const res = await fetch(`${endpoint.replace(/\/$/, "")}/api/feedback`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          message,
-          severity,
-          product: "chrome",
-          version: "0.2.11",
-          context,
-        }),
+      const r = await fileFeedback({
+        message, severity, product: "chrome", version: "0.2.12", context, endpoint,
       });
-      const bodyText = await res.text();
-      if (!res.ok) {
-        throw new Error(`feedback POST failed: ${res.status} ${bodyText.slice(0, 300)}`);
-      }
-      const parsed = JSON.parse(bodyText) as { url?: string; issue_number?: number };
-      return { content: [{ type: "text", text: `filed issue #${parsed.issue_number} — ${parsed.url}` }] };
+      const via = r.authored_by === "user" ? "via your gh CLI" : "via shared bot (install gh + auth to file as yourself)";
+      return { content: [{ type: "text", text: `filed issue #${r.issue_number} ${via} — ${r.url}` }] };
     },
   },
 ];
