@@ -44,12 +44,20 @@ async function targetIdFor(page: Page): Promise<string> {
   }
 }
 
-async function claimPage(page: Page, force = false): Promise<void> {
+async function claimPage(page: Page, force: boolean | "break_active" = false): Promise<void> {
   installCleanup();
   const targetId = await targetIdFor(page);
   const url = page.url();
   const result = acquireLock(DEFAULT_PORT, targetId, url, force);
   if (!result.ok) {
+    if (result.reason === "active_protected") {
+      throw new Error(
+        `Tab is owned by an active chrome-mcp session (${formatOwner(result.owner)}). ` +
+          `It's heartbeating right now — yanking it would break the other session's flow. ` +
+          `If you've coordinated with the user, escalate to take_tab { force_break_active: true }. ` +
+          `Otherwise wait for them to release it (~15s of inactivity), or use a different tab via select_tab.`,
+      );
+    }
     throw new Error(
       `Tab is locked by another chrome-mcp session (${formatOwner(result.owner)}). ` +
         `Two Claude Code sessions can't safely drive the same tab. ` +
@@ -339,7 +347,7 @@ export async function getActivePage(): Promise<Page> {
   return activePage;
 }
 
-export async function selectPageByIndex(index: number, force = false): Promise<Page> {
+export async function selectPageByIndex(index: number, force: boolean | "break_active" = false): Promise<Page> {
   const pages = await listPages();
   if (index < 0 || index >= pages.length) {
     throw new Error(`Tab index ${index} out of range (have ${pages.length} tabs)`);
@@ -351,7 +359,7 @@ export async function selectPageByIndex(index: number, force = false): Promise<P
   return activePage;
 }
 
-export async function selectPageByUrlSubstring(match: string, force = false): Promise<Page> {
+export async function selectPageByUrlSubstring(match: string, force: boolean | "break_active" = false): Promise<Page> {
   const pages = await listPages();
   const found = pages.find((p) => p.url().includes(match));
   if (!found) throw new Error(`No tab whose URL contains "${match}"`);
@@ -367,7 +375,7 @@ export function setActivePage(page: Page) {
   // Caller is responsible for claimPage — kept here for back-compat.
 }
 
-export async function claimActivePage(force = false): Promise<void> {
+export async function claimActivePage(force: boolean | "break_active" = false): Promise<void> {
   if (!activePage || activePage.isClosed()) {
     const pages = await listPages();
     if (pages.length === 0) throw new Error("No tab open to claim.");

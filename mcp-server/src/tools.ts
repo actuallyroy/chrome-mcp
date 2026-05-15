@@ -24,6 +24,33 @@ function resizePngBase64(b64: string, maxDim: number): string {
   }
   return PNG.sync.write(dst).toString("base64");
 }
+
+// Build a ToolResult from raw screenshot bytes: optionally write the
+// full-resolution PNG to disk, optionally include the (downscaled) inline image.
+function finalizeScreenshot(
+  buf: Uint8Array,
+  opts: { save_path?: string; return_inline: boolean; max_dim: number },
+): { content: { type: "text" | "image"; text?: string; data?: string; mimeType?: string }[] } {
+  const content: { type: "text" | "image"; text?: string; data?: string; mimeType?: string }[] = [];
+  let saved_bytes: number | null = null;
+  if (opts.save_path) {
+    mkdirSync(dirname(opts.save_path), { recursive: true });
+    writeFileSync(opts.save_path, buf);
+    saved_bytes = buf.length;
+  }
+  if (opts.return_inline) {
+    const b64 = resizePngBase64(Buffer.from(buf).toString("base64"), opts.max_dim);
+    content.push({ type: "image", data: b64, mimeType: "image/png" });
+  }
+  if (opts.save_path) {
+    content.push({ type: "text", text: `wrote ${saved_bytes} bytes to ${opts.save_path}` });
+  } else if (!opts.return_inline) {
+    // Edge case: no save_path AND return_inline=false. Tell the caller something happened.
+    content.push({ type: "text", text: `screenshot taken (${buf.length} bytes); not returned (return_inline=false, no save_path)` });
+  }
+  return { content };
+}
+
 import {
   armNextDialog,
   claimActivePage,
@@ -38,7 +65,8 @@ import {
   setActivePage,
 } from "./browser.js";
 import { formatOwner, listFreshLocks } from "./tab-lock.js";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import {
   getRecentCalls,
   recorderStatus,
@@ -716,31 +744,49 @@ export const tools: Tool[] = [
   },
   {
     name: "select_tab",
-    description: "Make a tab active. Provide index (from list_tabs) or url_contains (substring). Fails if another chrome-mcp session has claimed the tab — pass force=true to override.",
+    description:
+      "Make a tab active. Provide index (from list_tabs) or url_contains (substring). " +
+      "Fails if another chrome-mcp session owns the tab — pass `force: true` to take over a stale/idle owner. " +
+      "An owner that's actively heartbeating (within ~15s) is *protected*: a plain `force: true` will be refused. " +
+      "Pass `force_break_active: true` only when you've coordinated with the user to interrupt the other session.",
     schema: z.object({
       index: z.number().int().optional(),
       url_contains: z.string().optional(),
       force: z.boolean().default(false),
+      force_break_active: z
+        .boolean()
+        .default(false)
+        .describe("Yank the tab from another session that's actively heartbeating. Use only with explicit user permission — bypassing the active-protection grace period otherwise causes ping-pong stealing."),
     }),
     handler: async (args) => {
-      const { index, url_contains, force } = args as {
+      const { index, url_contains, force, force_break_active } = args as {
         index?: number;
         url_contains?: string;
         force: boolean;
+        force_break_active: boolean;
       };
+      const f: boolean | "break_active" = force_break_active ? "break_active" : force;
       let page: Page;
-      if (typeof index === "number") page = await selectPageByIndex(index, force);
-      else if (url_contains) page = await selectPageByUrlSubstring(url_contains, force);
+      if (typeof index === "number") page = await selectPageByIndex(index, f);
+      else if (url_contains) page = await selectPageByUrlSubstring(url_contains, f);
       else throw new Error("Provide either 'index' or 'url_contains'");
       return text(`Active tab: ${page.url()}`);
     },
   },
   {
     name: "take_tab",
-    description: "Forcibly claim the currently-active tab even if another chrome-mcp session owns it. Use when list_tabs shows a stale lock or you intentionally want to take over.",
-    schema: z.object({}),
-    handler: async () => {
-      await claimActivePage(true);
+    description:
+      "Claim the currently-active tab. By default refuses if another chrome-mcp session is *actively* heartbeating on it (within ~15s) — yanking from an active session causes ping-pong stealing (issue #14). " +
+      "Pass `force_break_active: true` only with explicit user permission to interrupt the other session.",
+    schema: z.object({
+      force_break_active: z
+        .boolean()
+        .default(false)
+        .describe("Take the tab even from an actively-heartbeating owner. Use only with explicit user permission."),
+    }),
+    handler: async (args) => {
+      const { force_break_active } = args as { force_break_active: boolean };
+      await claimActivePage(force_break_active ? "break_active" : true);
       const p = await getActivePage();
       return text(`Took tab: ${p.url()}`);
     },
@@ -840,17 +886,42 @@ export const tools: Tool[] = [
   {
     name: "screenshot",
     description:
-      "Take a PNG screenshot of the active tab, auto-downscaled to fit the MCP 2000px image limit. Set full_page=true for the full scrollable area. Prefer `outline` for navigation and element lookup — it's cheaper, faster, and returns stable refs. Use screenshot only for visual verification, layout bugs, or content the DOM can't describe (canvas, charts, rendered media).",
+      "Take a PNG screenshot of the active tab. By default returns inline (downscaled to fit MCP's 2000px image cap). " +
+      "Pass `save_path` to also write the *original* (un-downscaled) PNG to disk — required for archiving captures into manuals, regression baselines, or any task where the inline preview's resolution is too low. " +
+      "Use `clip` to capture a region or `selector` to auto-clip to a DOM element's bounding box. " +
+      "Prefer `outline` for navigation and element lookup; use `screenshot` for visual verification, layout bugs, canvas/charts/media.",
     schema: z.object({
       full_page: z.boolean().default(false),
       max_dim: z.number().int().min(256).max(2000).default(1600),
+      save_path: z.string().optional().describe("Absolute path on the host to write the full-resolution PNG to. When set, the file is written even if return_inline=false."),
+      return_inline: z.boolean().default(true).describe("Include the (downscaled) PNG in the tool result. Set false when archiving so you don't pay the inline-image overhead."),
+      clip: z.object({
+        x: z.number(), y: z.number(), width: z.number().min(1), height: z.number().min(1),
+      }).optional().describe("CSS-pixel rect to clip to. Mutually exclusive with full_page and selector."),
+      selector: z.string().optional().describe("CSS selector — the screenshot is clipped to this element's bounding box. Mutually exclusive with full_page and clip."),
     }),
     handler: async (args) =>
       withPage(async (p) => {
-        const { full_page, max_dim } = args as { full_page: boolean; max_dim: number };
-        const buf = (await p.screenshot({ fullPage: full_page, type: "png" })) as Uint8Array;
-        const b64 = resizePngBase64(Buffer.from(buf).toString("base64"), max_dim);
-        return { content: [{ type: "image", data: b64, mimeType: "image/png" }] };
+        const { full_page, max_dim, save_path, return_inline, clip, selector } = args as {
+          full_page: boolean; max_dim: number;
+          save_path?: string; return_inline: boolean;
+          clip?: { x: number; y: number; width: number; height: number };
+          selector?: string;
+        };
+        // Mutual exclusion sanity check.
+        const modes = [full_page, !!clip, !!selector].filter(Boolean).length;
+        if (modes > 1) throw new Error("screenshot: full_page, clip, and selector are mutually exclusive — pick one.");
+
+        let opts: Parameters<typeof p.screenshot>[0] = { fullPage: full_page, type: "png" };
+        if (clip) opts = { type: "png", clip };
+        else if (selector) {
+          const el = await p.$(selector);
+          if (!el) throw new Error(`screenshot: selector "${selector}" matched no element`);
+          const buf = (await el.screenshot({ type: "png" })) as Uint8Array;
+          return finalizeScreenshot(buf, { save_path, return_inline, max_dim });
+        }
+        const buf = (await p.screenshot(opts)) as Uint8Array;
+        return finalizeScreenshot(buf, { save_path, return_inline, max_dim });
       }),
   },
   {
@@ -1214,7 +1285,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "chrome",
-          version: "0.2.6",
+          version: "0.2.11",
           context,
         }),
       });

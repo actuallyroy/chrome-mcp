@@ -69,14 +69,14 @@ const FLOW_CAP = 20;
 // Mirror the dispatcher's auto-dismiss policy so run_script steps get the
 // same overlay clearing the top-level calls get.
 const RUN_SCRIPT_INTERACTIVE = new Set<string>([
-  "click", "fill", "press_key", "long_press", "swipe", "scroll",
+  "click", "try_click", "fill", "press_key", "long_press", "swipe", "scroll",
   "launch_app", "stop_app", "install_app", "clear_app_data",
 ]);
 const RUN_SCRIPT_SKIP_AUTO_DISMISS = new Set<string>([
   "dismiss_dev_overlay",
   "install_adb",
   "list_devices", "select_device", "device_info", "current_app",
-  "screenshot", "outline", "describe", "wait_for_stable", "assert",
+  "screenshot", "outline", "describe", "wait_for_stable", "wait_for_element", "assert",
   "get_logcat", "adb_shell",
   "sqlite_list_packages", "sqlite_list_databases", "sqlite_list_tables",
   "sqlite_table_schema", "sqlite_query", "sqlite_pull_db", "sqlite_check",
@@ -354,6 +354,57 @@ export const tools: Tool[] = [
     },
   },
   {
+    name: "try_click",
+    description:
+      "Tap an element if it exists; no-op if not. Returns {clicked: true|false, ref?: id}. " +
+      "For conditional UI in saved flows: permission prompts, onboarding sheets, optional toasts that may or may not appear. Pair with `on_error` per-step in run_script / save_flow.",
+    schema: z.object(Locator),
+    handler: async (args) => {
+      try {
+        const elId = await resolveElementId(args as LocatorArgs);
+        await clickElement(elId);
+        return json({ clicked: true, element_id: elId });
+      } catch (e) {
+        const msg = (e as Error).message || String(e);
+        if (/no such element|not located|ElementNotFound/i.test(msg)) {
+          return json({ clicked: false, reason: "element not present" });
+        }
+        throw e;
+      }
+    },
+  },
+  {
+    name: "wait_for_element",
+    description:
+      "Poll the view hierarchy until a matching element appears, then return its ref. " +
+      "For non-deterministic UI (Expo dev launcher reorders buttons between launches; sync screens load slowly). " +
+      "Locator: text | desc | id | xpath | class | selector — same as click. Throws on timeout.",
+    schema: z.object({
+      ...Locator,
+      timeout_ms: z.number().int().min(100).default(10_000),
+      poll_ms: z.number().int().min(50).default(400),
+    }),
+    handler: async (args) => {
+      const { timeout_ms, poll_ms, ...loc } = args as LocatorArgs & { timeout_ms: number; poll_ms: number };
+      const start = Date.now();
+      const deadline = start + timeout_ms;
+      let lastErr = "";
+      let attempts = 0;
+      while (Date.now() < deadline) {
+        attempts++;
+        try {
+          const elId = await resolveElementId(loc);
+          return json({ ok: true, element_id: elId, ms: Date.now() - start, attempts });
+        } catch (e) {
+          lastErr = (e as Error).message || String(e);
+          if (!/no such element|not located|ElementNotFound/i.test(lastErr)) throw e;
+        }
+        await new Promise((r) => setTimeout(r, poll_ms));
+      }
+      throw new Error(`wait_for_element: timed out after ${timeout_ms}ms / ${attempts} attempts. Last error: ${lastErr}`);
+    },
+  },
+  {
     name: "rn_dev_reload",
     description:
       "Reload a React Native app via the dev shortcut: sends KEYCODE_R twice. Works even when the red-box error overlay is up (its buttons aren't in the UiAutomator tree, so `click` can't find them).",
@@ -537,7 +588,9 @@ export const tools: Tool[] = [
   {
     name: "wait_for_stable",
     description:
-      "Poll the view-hierarchy XML and return once it stops changing. By default requires 3 consecutive identical snapshots (~750ms of quiet) — bump `stable_polls` if you need higher confidence on screens with mid-load dwell windows. Reports actual elapsed time + poll count so you can verify it really settled.",
+      "Poll the view-hierarchy XML and return once it stops changing. " +
+      "By default compares full XML — but on screens with persistent ticking elements (countdown timers, sync progress, animated text) full equality NEVER holds, so use `mode: \"structure\"` (compares node tree shape + ids + classes + bounds, ignoring text) or pass `ignore_text_regex` to mask known volatile text like `\"\\\\d+:\\\\d+:\\\\d+\"`. " +
+      "Reports elapsed time + poll count so you can verify it settled, and returns a short diff summary when it times out so you can see what kept changing.",
     schema: z.object({
       timeout_ms: z.number().int().min(100).default(5000),
       poll_ms: z.number().int().min(50).default(250),
@@ -547,17 +600,68 @@ export const tools: Tool[] = [
         .min(1)
         .default(3)
         .describe("Number of consecutive identical snapshots required to consider the screen stable. Higher = stricter."),
+      mode: z
+        .enum(["text", "structure"])
+        .default("text")
+        .describe("`text` = full XML equality (default). `structure` = compare node shape + resource-id + class + bounds, ignore inner text. Use `structure` when timers/clocks/progress text mutate every frame."),
+      ignore_text_regex: z
+        .string()
+        .optional()
+        .describe("Regex (JS syntax, no slashes). Substrings inside text=\"...\" or content-desc=\"...\" matching this are masked before comparison. Combine with default `mode: text` to ignore just one ticking widget instead of all text."),
     }),
     handler: async (args) => {
-      const { timeout_ms, poll_ms, stable_polls: required } = args as {
+      const { timeout_ms, poll_ms, stable_polls: required, mode, ignore_text_regex } = args as {
         timeout_ms: number;
         poll_ms: number;
         stable_polls: number;
+        mode: "text" | "structure";
+        ignore_text_regex?: string;
       };
       const start = Date.now();
       const deadline = start + timeout_ms;
       const { dumpSource } = await import("./uiautomator2.js");
-      let prev = "";
+
+      let ignore: RegExp | null = null;
+      if (ignore_text_regex) {
+        try { ignore = new RegExp(ignore_text_regex, "g"); }
+        catch (e) { throw new Error(`Invalid ignore_text_regex: ${(e as Error).message}`); }
+      }
+
+      const normalize = (xml: string): string => {
+        if (!xml) return "";
+        let out = xml;
+        if (ignore) {
+          // Mask matches inside text="..." and content-desc="..." attributes only.
+          out = out.replace(/(text|content-desc)="([^"]*)"/g, (_m, attr, val) => {
+            const masked = val.replace(ignore!, "·");
+            return `${attr}="${masked}"`;
+          });
+        }
+        if (mode === "structure") {
+          // Drop text + content-desc attribute values entirely; keep node
+          // shape + resource-id + class + bounds + clickable etc.
+          out = out.replace(/(text|content-desc)="[^"]*"/g, '$1=""');
+        }
+        return out;
+      };
+
+      const summarizeDiff = (a: string, b: string): string => {
+        if (!a || !b) return "(empty snapshot)";
+        if (a === b) return "(identical after normalize)";
+        const max = 220;
+        // Find first differing region.
+        let i = 0;
+        const n = Math.min(a.length, b.length);
+        while (i < n && a[i] === b[i]) i++;
+        const lo = Math.max(0, i - 40);
+        const hi = Math.min(Math.max(a.length, b.length), i + 80);
+        const left = a.slice(lo, hi).replace(/\s+/g, " ");
+        const right = b.slice(lo, hi).replace(/\s+/g, " ");
+        return `at offset ${i}: "...${left.slice(0, max)}..." vs "...${right.slice(0, max)}..."`;
+      };
+
+      let prevRaw = "";
+      let prevNorm = "";
       let consecutive = 0;
       let polls = 0;
       let dump_errors = 0;
@@ -565,7 +669,8 @@ export const tools: Tool[] = [
         polls++;
         let cur = "";
         try { cur = await dumpSource(); } catch { dump_errors++; cur = ""; }
-        if (cur && cur === prev) {
+        const curNorm = normalize(cur);
+        if (curNorm && curNorm === prevNorm) {
           consecutive++;
           if (consecutive >= required - 1) {
             return json({
@@ -575,14 +680,20 @@ export const tools: Tool[] = [
               polls,
               consecutive_matches: consecutive + 1,
               dump_errors,
+              mode,
             });
           }
         } else {
           consecutive = 0;
         }
-        prev = cur;
+        prevRaw = cur;
+        prevNorm = curNorm;
         await new Promise((r) => setTimeout(r, poll_ms));
       }
+      // Take one final snapshot for the diff summary so the caller can see
+      // what kept changing.
+      let finalCur = "";
+      try { finalCur = await dumpSource(); } catch { /* ignore */ }
       return json({
         ok: false,
         status: "timeout",
@@ -590,6 +701,8 @@ export const tools: Tool[] = [
         polls,
         consecutive_matches: consecutive + 1,
         dump_errors,
+        mode,
+        diff_hint: summarizeDiff(normalize(prevRaw), normalize(finalCur)),
       });
     },
   },
@@ -885,7 +998,7 @@ export const tools: Tool[] = [
           message,
           severity,
           product: "android",
-          version: "0.1.23",
+          version: "0.1.24",
           context,
         }),
       });
@@ -930,7 +1043,12 @@ export const tools: Tool[] = [
         .max(20)
         .optional(),
       steps: z
-        .array(z.object({ tool: z.string(), args: z.record(z.any()).optional() }))
+        .array(z.object({
+          tool: z.string(),
+          args: z.record(z.any()).optional(),
+          skip: z.boolean().optional().describe("If true, the step is recorded but not executed at run time."),
+          on_error: z.enum(["continue", "stop"]).optional().describe("Per-step error policy. `continue` lets the flow proceed past a failure on this step (useful for conditional UI like permission prompts that may or may not appear)."),
+        }).strict())
         .min(1)
         .max(200),
       overwrite: z.boolean().default(false),
@@ -940,7 +1058,7 @@ export const tools: Tool[] = [
         name: string;
         description: string;
         params?: { name: string; type: "string" | "number" | "boolean"; description?: string; required?: boolean }[];
-        steps: { tool: string; args?: Record<string, unknown> }[];
+        steps: { tool: string; args?: Record<string, unknown>; skip?: boolean; on_error?: "continue" | "stop" }[];
         overwrite: boolean;
       };
       if (!FLOW_NAME_RE.test(a.name)) {

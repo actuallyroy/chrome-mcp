@@ -1,10 +1,15 @@
 import {
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
+  renameSync,
   unlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -21,7 +26,12 @@ export type FlowParam = {
   required?: boolean;
 };
 
-export type FlowStep = { tool: string; args?: Record<string, unknown> };
+export type FlowStep = {
+  tool: string;
+  args?: Record<string, unknown>;
+  skip?: boolean;
+  on_error?: "continue" | "stop";
+};
 
 export type FlowDoc = {
   name: string;
@@ -58,11 +68,23 @@ export function readFlow(name: string): FlowDoc | null {
   try { return JSON.parse(readFileSync(p, "utf8")) as FlowDoc; } catch { return null; }
 }
 
+// Atomic write + fsync. Plain writeFileSync left a small window where a fast
+// process exit (MCP reconnect kills the server) lost the freshly-saved flow,
+// so on the next start the loader read a stale version from disk (issue #13a).
 export function writeFlow(doc: FlowDoc): string {
   mkdirSync(FLOWS_DIR, { recursive: true });
   const p = flowPath(doc.name);
+  const tmp = `${p}.tmp.${process.pid}.${Date.now()}`;
   const stamped = { ...doc, saved_at: new Date().toISOString() };
-  writeFileSync(p, JSON.stringify(stamped, null, 2), "utf8");
+  const body = JSON.stringify(stamped, null, 2);
+  const fd = openSync(tmp, "w");
+  try {
+    writeSync(fd, body);
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+  renameSync(tmp, p);
   return p;
 }
 
@@ -117,9 +139,16 @@ export function flowAsTool(doc: FlowDoc): Tool {
     description: `[saved flow, ${doc.steps.length} steps] ${doc.description}${paramSummary}`,
     schema: paramsSchema(doc.params),
     handler: async (args): Promise<ToolResult> => {
-      const steps = doc.steps.map((s) => ({
+      // Re-read from disk on every invocation: another process (or a previous
+      // save_flow that survived a fast restart) may have updated the file
+      // since this tool object was built. Falls back to the captured doc if
+      // the file's gone (deleted while still registered in-memory).
+      const live = readFlow(doc.name) ?? doc;
+      const steps = live.steps.map((s) => ({
         tool: s.tool,
         args: substituteParams(s.args ?? {}, args as Record<string, unknown>) as Record<string, unknown>,
+        skip: s.skip,
+        on_error: s.on_error,
       }));
       // Dynamic import to avoid the flows.ts ↔ tools.ts cycle at module load.
       const { runSteps } = await import("./tools.js");

@@ -20,6 +20,10 @@ const LOCK_DIR = process.env.CHROME_MCP_LOCK_DIR || join(homedir(), ".chrome-mcp
 const LOCK_FILE = join(LOCK_DIR, "tab-locks.json");
 const STALE_MS = 30_000;
 const HEARTBEAT_MS = 5_000;
+// Grace period: a recently-active owner can't be force-taken without an extra
+// `force_break_active` confirmation. Stops two sessions ping-pong-stealing a
+// tab from each other (issue #14). "Active" = heartbeat within the last 15s.
+const ACTIVE_MS = 15_000;
 
 export const SESSION_ID = randomUUID();
 
@@ -59,24 +63,32 @@ function key(port: number, targetId: string): string {
 
 export type AcquireResult =
   | { ok: true }
-  | { ok: false; owner: Lock };
+  | { ok: false; owner: Lock; reason: "held" | "active_protected" };
+
+function isActive(lock: Lock): boolean {
+  return Date.now() - lock.heartbeat < ACTIVE_MS;
+}
 
 export function acquireLock(
   port: number,
   targetId: string,
   url: string,
-  force = false,
+  force: boolean | "break_active" = false,
 ): AcquireResult {
   const locks = readLocks();
   const k = key(port, targetId);
   const existing = locks[k];
-  if (
-    existing &&
-    existing.session_id !== SESSION_ID &&
-    !isStale(existing) &&
-    !force
-  ) {
-    return { ok: false, owner: existing };
+  if (existing && existing.session_id !== SESSION_ID && !isStale(existing)) {
+    // Recently-active owner: refuse plain `force=true`. Caller must escalate
+    // to `force === "break_active"` (the take_tab tool maps a separate
+    // `force_break_active: true` flag onto this), which forces them to
+    // acknowledge they're yanking from a working session.
+    if (isActive(existing) && force !== "break_active") {
+      return { ok: false, owner: existing, reason: "active_protected" };
+    }
+    if (!force) {
+      return { ok: false, owner: existing, reason: "held" };
+    }
   }
   locks[k] = {
     session_id: SESSION_ID,
