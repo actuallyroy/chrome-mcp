@@ -120,6 +120,35 @@ export const INSTRUMENTATION_SCRIPT = `
     return partial[0] || null;
   }
 
+  // Same matching rules as findByText, but returns ALL candidates with a
+  // descriptor so the tool layer can warn about ambiguous matches (issue #17).
+  // Order: exact matches first, then contains-matches in DOM order.
+  function findAllByText(text) {
+    const target = text.trim();
+    const els = interactiveElements();
+    const exact = [];
+    const partial = [];
+    for (const e of els) {
+      const inner = (e.innerText || e.textContent || '').trim();
+      const aria = (e.getAttribute('aria-label') || '').trim();
+      if (inner === target || aria === target) exact.push(e);
+      else if (inner.includes(target)) partial.push(e);
+    }
+    const ordered = [...exact, ...partial];
+    return ordered.map(e => {
+      const ref = e.getAttribute('data-mcp-ref');
+      const inner = (e.innerText || e.textContent || '').trim();
+      const aria = (e.getAttribute('aria-label') || '').trim();
+      return {
+        ref: ref ? Number(ref) : null,
+        role: elRole(e),
+        text: inner.slice(0, 80),
+        aria_label: aria.slice(0, 80) || undefined,
+        exact: inner === target || aria === target,
+      };
+    });
+  }
+
   function findByLabel(label) {
     const target = label.replace(/\\*/g,'').trim().toLowerCase();
     // Native <label for=>
@@ -407,6 +436,7 @@ export const INSTRUMENTATION_SCRIPT = `
     network: [],
     paused: false,
     findByText,
+    findAllByText,
     findByLabel,
     findByRef,
     describeElement,

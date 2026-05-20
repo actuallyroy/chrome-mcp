@@ -65,7 +65,7 @@ import {
   setActivePage,
 } from "./browser.js";
 import { formatOwner, listFreshLocks } from "./tab-lock.js";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileFeedback } from "./feedback.js";
 import {
@@ -146,7 +146,20 @@ type LocatorArgs = {
   selector?: string;
 };
 
+type Candidate = { ref: number | null; role: string; text: string; aria_label?: string; exact: boolean };
+
+// Per-call ambiguity info, captured by resolveLocator and surfaced by the
+// tool layer (issue #17). Only set when `text` resolved with >1 candidate.
+let lastAmbiguity: { locator_text: string; candidates: Candidate[] } | null = null;
+
+export function takeAmbiguity(): { locator_text: string; candidates: Candidate[] } | null {
+  const a = lastAmbiguity;
+  lastAmbiguity = null;
+  return a;
+}
+
 async function resolveLocator(page: Page, loc: LocatorArgs): Promise<ElementHandle<Element>> {
+  lastAmbiguity = null;
   if (loc.ref != null) {
     const h = await page.$(`[data-mcp-ref="${loc.ref}"]`);
     if (h) return h;
@@ -158,6 +171,18 @@ async function resolveLocator(page: Page, loc: LocatorArgs): Promise<ElementHand
     throw new Error(`No element matches selector: ${loc.selector}`);
   }
   if (loc.text) {
+    // Pull the full candidate list so we can surface ambiguity when N>1.
+    const candidates = await page.evaluate(
+      (t: string) => (window as unknown as { __mcp: { findAllByText(s: string): Candidate[] } }).__mcp.findAllByText(t),
+      loc.text,
+    );
+    if (!candidates || candidates.length === 0) {
+      throw new Error(`No interactive element with text: "${loc.text}"`);
+    }
+    if (candidates.length > 1) {
+      lastAmbiguity = { locator_text: loc.text, candidates };
+    }
+    // Use the canonical findByText so picking semantics stay identical to before.
     const h = await page.evaluateHandle(
       (t: string) => (window as unknown as { __mcp: { findByText(s: string): Element | null } }).__mcp.findByText(t),
       loc.text,
@@ -176,6 +201,21 @@ async function resolveLocator(page: Page, loc: LocatorArgs): Promise<ElementHand
     throw new Error(`No form field with label: "${loc.label}"`);
   }
   throw new Error("Provide one of: ref, text, label, or selector.");
+}
+
+function appendAmbiguity(result: ToolResult): ToolResult {
+  const a = takeAmbiguity();
+  if (!a) return result;
+  const picked = a.candidates[0];
+  const others = a.candidates.slice(1, 5);
+  const otherLines = others.map((c) => `    - [${c.role}${c.exact ? "" : " contains"} ref=${c.ref ?? "?"}] "${c.text}"${c.aria_label ? ` aria="${c.aria_label}"` : ""}`);
+  const moreCount = a.candidates.length - 1 - others.length;
+  const more = moreCount > 0 ? `\n    … and ${moreCount} more` : "";
+  const block = `\n\n[ambiguous] text="${a.locator_text}" matched ${a.candidates.length} interactive elements. Picked:\n    [${picked.role}${picked.exact ? "" : " contains"} ref=${picked.ref ?? "?"}] "${picked.text}"\n  Other candidates:\n${otherLines.join("\n")}${more}\n  → If this isn't what you wanted, target by ref (from outline) or by selector.`;
+  return {
+    ...result,
+    content: [...result.content, { type: "text", text: block }],
+  };
 }
 
 async function clickHandle(page: Page, h: ElementHandle<Element>) {
@@ -406,6 +446,7 @@ export const tools: Tool[] = [
         // and be auto-handled before we sample dialogsSince.
         await new Promise((r) => setTimeout(r, 100));
         let result = text(`clicked (${loc.ref ? `ref=${loc.ref}` : loc.text ? `text="${loc.text}"` : loc.label ? `label="${loc.label}"` : loc.selector})`);
+        result = appendAmbiguity(result);
         result = appendDialogs(result, dialogsSince(p, watermark));
         if (capture_toast) {
           const toasts = await toastsSince(p, watermark, toast_wait_ms);
@@ -435,12 +476,41 @@ export const tools: Tool[] = [
         const watermark = Date.now();
         await fillHandle(p, h, value);
         let result = text(`filled (${loc.ref ? `ref=${loc.ref}` : loc.label ? `label="${loc.label}"` : loc.selector})`);
+        result = appendAmbiguity(result);
         result = appendDialogs(result, dialogsSince(p, watermark));
         if (capture_toast) {
           const toasts = await toastsSince(p, watermark, toast_wait_ms);
           result = appendToasts(result, toasts);
         }
         return result;
+      }),
+  },
+  {
+    name: "set_input_files",
+    description:
+      "Attach files to an <input type=file> (visible or hidden). Wraps Puppeteer's elementHandle.uploadFile, which uses CDP's Page.setFileInputFiles — bypasses the browser restriction that prevents setting `value` programmatically. " +
+      "Use this for end-to-end testing of upload flows (CSV/XLSX import, image upload, etc). Pass absolute paths.",
+    schema: z.object({
+      ...Locator,
+      paths: z.array(z.string()).min(1).describe("Absolute paths to the files to attach."),
+    }),
+    handler: async (args) =>
+      withPage(async (p) => {
+        const { paths, ...loc } = args as LocatorArgs & { paths: string[] };
+        // Verify the files exist on disk so the user gets a clear error
+        // before CDP fails with a less obvious message.
+        for (const fp of paths) {
+          if (!existsSync(fp)) throw new Error(`set_input_files: file not found at ${fp} (must be an absolute path)`);
+        }
+        const h = await resolveLocator(p, loc);
+        const isFileInput = await h.evaluate((el) =>
+          el.tagName === "INPUT" && (el as HTMLInputElement).type === "file",
+        );
+        if (!isFileInput) {
+          throw new Error("set_input_files: resolved element is not an <input type=file>. Resolve the actual file input — many UIs hide it behind a styled button; use a selector like 'input[type=file]' to target it directly.");
+        }
+        await (h as ElementHandle<HTMLInputElement>).uploadFile(...paths);
+        return text(`set ${paths.length} file${paths.length === 1 ? "" : "s"}: ${paths.join(", ")}`);
       }),
   },
   {
@@ -1282,7 +1352,7 @@ export const tools: Tool[] = [
         }));
       }
       const r = await fileFeedback({
-        message, severity, product: "chrome", version: "0.2.12", context, endpoint,
+        message, severity, product: "chrome", version: "0.2.13", context, endpoint,
       });
       const via = r.authored_by === "user" ? "via your gh CLI" : "via shared bot (install gh + auth to file as yourself)";
       return { content: [{ type: "text", text: `filed issue #${r.issue_number} ${via} — ${r.url}` }] };
