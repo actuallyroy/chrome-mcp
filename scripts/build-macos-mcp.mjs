@@ -7,6 +7,7 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   writeFileSync,
 } from "node:fs";
@@ -71,6 +72,16 @@ if (existsSync(helperSrc)) {
   console.warn(`WARN: ${helperSrc} not found. Helper won't be in the published bundle. Run scripts/build-helper.sh on a macOS host first.`);
 }
 
+// 3b. Package the Swift sources so the loader can compile the helper locally
+// on the user's machine (works around Tahoe AMFI killing downloaded
+// adhoc-signed binaries).
+const swiftSrcDir = join(MCP_DIR, "swift-helper", "Sources", "MacosMcpHelper");
+const sourcesTar = join(VENDOR_DIR, `helper-src-v${version}.tar.gz`);
+// Flat tar so the loader can `tar -xzf` into a single directory.
+run(`tar -czf ${JSON.stringify(sourcesTar)} -C ${JSON.stringify(swiftSrcDir)} ${readdirSync(swiftSrcDir).filter((f) => f.endsWith(".swift")).map((f) => JSON.stringify(f)).join(" ")}`, ROOT);
+const sourcesBytes = readFileSync(sourcesTar);
+console.log(`vendor/helper-src-v${version}.tar.gz (${(sourcesBytes.length / 1024).toFixed(0)} KB)`);
+
 // 4. Manifest.
 const manifest = {
   product: "macos-mcp",
@@ -87,6 +98,11 @@ const manifest = {
         size_bytes: helperBytes.length,
       }
     : null,
+  helper_sources: {
+    url: `/macos/vendor/helper-src-v${version}.tar.gz`,
+    sha256: createHash("sha256").update(sourcesBytes).digest("hex"),
+    size_bytes: sourcesBytes.length,
+  },
 };
 writeFileSync(join(BUNDLE_DIR, "manifest.json"), JSON.stringify(manifest, null, 2));
 

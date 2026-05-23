@@ -31,7 +31,7 @@ swiftc -O -parse-as-library \
   -sdk "${MACOS_MCP_SDK:-/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk}" \
   -target arm64-apple-macos14.0 \
   -framework AppKit -framework ApplicationServices -framework ScreenCaptureKit \
-  -framework CoreGraphics -framework UniformTypeIdentifiers -framework Foundation \
+  -framework CoreGraphics -framework UniformTypeIdentifiers -framework Foundation -framework Vision \
   -o "$ARM_BIN" \
   "$SRC"/*.swift
 
@@ -41,7 +41,7 @@ if [[ "${BUILD_UNIVERSAL:-0}" == "1" ]]; then
     -sdk "${MACOS_MCP_SDK:-/Library/Developer/CommandLineTools/SDKs/MacOSX15.5.sdk}" \
     -target x86_64-apple-macos14.0 \
     -framework AppKit -framework ApplicationServices -framework ScreenCaptureKit \
-    -framework CoreGraphics -framework UniformTypeIdentifiers -framework Foundation \
+    -framework CoreGraphics -framework UniformTypeIdentifiers -framework Foundation -framework Vision \
     -o "$X86_BIN" \
     "$SRC"/*.swift
   echo "[build-helper] lipo into universal…"
