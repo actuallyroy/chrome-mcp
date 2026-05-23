@@ -39,7 +39,7 @@ export function setNotifyToolsChanged(fn: () => void) { notifyToolsChanged = fn;
 function emitToolsChanged() { if (notifyToolsChanged) notifyToolsChanged(); }
 
 const FLOW_CAP = 20;
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 
 // ---- AX outline renderer ----------------------------------------------------
 
@@ -359,7 +359,13 @@ export const tools: Tool[] = [
   {
     name: "press_key",
     description:
-      "Synthesize a keypress with optional modifiers. Known keys: RETURN/ENTER, TAB, SPACE, DELETE/BACKSPACE, ESC/ESCAPE, LEFT, RIGHT, UP, DOWN, HOME, END, PAGEUP, PAGEDOWN, F1..F12. Modifiers: cmd/command/meta, shift, opt/option/alt, ctrl/control, fn.",
+      "Synthesize a keypress with optional modifiers. " +
+      "Letters A-Z, digits 0-9, RETURN/ENTER, TAB, SPACE, DELETE/BACKSPACE, FORWARD_DELETE, ESC/ESCAPE, " +
+      "LEFT, RIGHT, UP, DOWN, HOME, END, PAGEUP, PAGEDOWN, F1..F12, " +
+      "GRAVE, MINUS, EQUAL, LEFT_BRACKET, RIGHT_BRACKET, BACKSLASH, SEMICOLON, QUOTE, COMMA, PERIOD, SLASH, " +
+      "CAPS_LOCK, HELP. " +
+      "Modifiers: cmd/command/meta, shift, opt/option/alt, ctrl/control, fn. Examples: " +
+      `press_key { key: "P", modifiers: ["cmd"] } for Cmd+P, press_key { key: "S", modifiers: ["cmd", "shift"] } for Cmd+Shift+S.`,
     schema: z.object({
       key: z.string(),
       modifiers: z.array(z.string()).default([]),

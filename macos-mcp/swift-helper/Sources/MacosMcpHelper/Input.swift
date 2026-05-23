@@ -54,15 +54,35 @@ enum Input {
     }
 
     // Common virtual key codes (HID). Names match the chrome/android API.
+    // Use names like "P", "1", "F12" — case-insensitive on lookup. Modifiers
+    // (cmd/shift/opt/ctrl/fn) are passed separately as a list of strings.
     static let KEYCODES: [String: CGKeyCode] = [
+        // Letters
+        "A": 0x00, "B": 0x0B, "C": 0x08, "D": 0x02, "E": 0x0E, "F": 0x03,
+        "G": 0x05, "H": 0x04, "I": 0x22, "J": 0x26, "K": 0x28, "L": 0x25,
+        "M": 0x2E, "N": 0x2D, "O": 0x1F, "P": 0x23, "Q": 0x0C, "R": 0x0F,
+        "S": 0x01, "T": 0x11, "U": 0x20, "V": 0x09, "W": 0x0D, "X": 0x07,
+        "Y": 0x10, "Z": 0x06,
+        // Digits (top row, not numpad)
+        "0": 0x1D, "1": 0x12, "2": 0x13, "3": 0x14, "4": 0x15,
+        "5": 0x17, "6": 0x16, "7": 0x1A, "8": 0x1C, "9": 0x19,
+        // Punctuation / common symbols
+        "GRAVE": 0x32, "MINUS": 0x1B, "EQUAL": 0x18,
+        "LEFT_BRACKET": 0x21, "RIGHT_BRACKET": 0x1E, "BACKSLASH": 0x2A,
+        "SEMICOLON": 0x29, "QUOTE": 0x27, "COMMA": 0x2B, "PERIOD": 0x2F, "SLASH": 0x2C,
+        // Editing keys
         "RETURN": 0x24, "ENTER": 0x24, "TAB": 0x30, "SPACE": 0x31,
         "DELETE": 0x33, "BACKSPACE": 0x33, "ESCAPE": 0x35, "ESC": 0x35,
+        "FORWARD_DELETE": 0x75,
+        // Arrows + navigation
         "LEFT": 0x7B, "RIGHT": 0x7C, "DOWN": 0x7D, "UP": 0x7E,
         "HOME": 0x73, "END": 0x77, "PAGEUP": 0x74, "PAGEDOWN": 0x79,
+        // Function keys
         "F1": 0x7A, "F2": 0x78, "F3": 0x63, "F4": 0x76,
         "F5": 0x60, "F6": 0x61, "F7": 0x62, "F8": 0x64,
         "F9": 0x65, "F10": 0x6D, "F11": 0x67, "F12": 0x6F,
-        "CAPS_LOCK": 0x39,
+        // Misc
+        "CAPS_LOCK": 0x39, "HELP": 0x72,
     ]
 
     // Modifier flags by name.
