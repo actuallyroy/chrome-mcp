@@ -9,6 +9,21 @@ import UniformTypeIdentifiers
 enum Capture {
     enum CaptureError: Error { case noDisplay, encodingFailed, ckError(String) }
 
+    // SCShareableContent is a heavy query (the WindowServer scans every window
+    // and app). Cache it for a few seconds — that's plenty stable for the
+    // sub-second cadence our tools call screenshot/OCR at.
+    private static var cachedContent: (content: SCShareableContent, ts: Date)?
+    private static let CACHE_TTL: TimeInterval = 5.0
+
+    private static func freshContent() async throws -> SCShareableContent {
+        if let cached = cachedContent, Date().timeIntervalSince(cached.ts) < CACHE_TTL {
+            return cached.content
+        }
+        let c = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+        cachedContent = (c, Date())
+        return c
+    }
+
     // Returns the raw CGImage AND the screen-point geometry of the captured
     // region. OCR uses this so its normalized bboxes can be mapped to actual
     // screen coordinates that CGEvent.post will land clicks on.
@@ -16,7 +31,7 @@ enum Capture {
     // When pid is given and a window for that app is found, we crop to that
     // window's frame. Otherwise we capture the main display in full.
     static func captureForOCR(pid: Int32? = nil) async throws -> (CGImage, CGPoint, CGSize) {
-        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+        let content = try await freshContent()
         guard let display = content.displays.first else { throw CaptureError.noDisplay }
 
         // Try for the foreground window of the target pid so OCR text positions
@@ -59,7 +74,7 @@ enum Capture {
     }
 
     static func screenshot(pid: Int32? = nil) async throws -> Data {
-        let content = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
+        let content = try await freshContent()
         guard let display = content.displays.first else { throw CaptureError.noDisplay }
 
         // If a pid is specified, restrict to that app's windows; otherwise full display.
