@@ -8,6 +8,7 @@ type Manifest = {
   size_bytes: number;
   released_at: string;
   uiautomator2?: { version: string };
+  helper?: { arch: string; url: string; sha256: string; size_bytes: number };
 };
 
 function read(relPath: string): string | null {
@@ -26,8 +27,10 @@ function readManifest(path: string): Manifest | null {
 export default function Page() {
   const chromeManifest = readManifest("bundle/manifest.json");
   const androidManifest = readManifest("android/bundle/manifest.json");
+  const macosManifest = readManifest("macos/bundle/manifest.json");
   const chromeBootstrap = read("bootstrap.min.js")?.trim() ?? "";
   const androidBootstrap = read("android/bootstrap.min.js")?.trim() ?? "";
+  const macosBootstrap = read("macos/bootstrap.min.js")?.trim() ?? "";
 
   return (
     <main>
@@ -85,6 +88,43 @@ export default function Page() {
             <a href="/android/bundle/manifest.json">manifest</a> ·{" "}
             <a href="/android/loader.mjs">loader.mjs</a> ·{" "}
             <a href="/android/vendor/uiautomator2-server.apk">u2 APK</a>
+          </p>
+        )}
+      </section>
+
+      <section>
+        <h2>
+          macos-mcp{" "}
+          {macosManifest && <span className="meta">v{macosManifest.version}</span>}
+          {macosManifest?.helper && (
+            <span className="meta"> · Swift helper {(macosManifest.helper.size_bytes / 1024).toFixed(0)} KB</span>
+          )}
+        </h2>
+        <p>
+          Drives any macOS desktop app — AppKit, Catalyst, SwiftUI, Electron — through the OS
+          Accessibility tree. Same locator ergonomics (text, role, AXIdentifier). Posts real{" "}
+          <code>CGEvent</code> mouse + keyboard input and grabs PNGs via ScreenCaptureKit. Bundled
+          Swift sidecar binary; macOS 14+; <strong>arm64 (Apple Silicon) only for now</strong>.
+        </p>
+        <p>
+          One-time TCC permission setup: grant <em>Accessibility</em> (required for AX inspection +
+          input) and <em>Screen Recording</em> (required for screenshots) when the OS prompts. Call{" "}
+          <code>open_permissions_settings</code> from the agent to jump to the right pane.
+        </p>
+        <h3>Paste into <code>~/.claude.json</code> and restart Claude Code:</h3>
+        <InstallBlock bootstrap={macosBootstrap} product="macos" />
+        {macosManifest && (
+          <p className="hash">
+            sha256: {macosManifest.sha256}
+            <br />
+            <a href={`/macos/bundle/v${macosManifest.version}.mjs`}>bundle</a> ·{" "}
+            <a href="/macos/bundle/manifest.json">manifest</a> ·{" "}
+            <a href="/macos/loader.mjs">loader.mjs</a>
+            {macosManifest.helper && (
+              <>
+                {" "}· <a href="/macos/vendor/macos-mcp-helper">Swift helper</a>
+              </>
+            )}
           </p>
         )}
       </section>

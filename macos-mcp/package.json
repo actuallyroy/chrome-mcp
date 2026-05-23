@@ -1,0 +1,35 @@
+{
+  "name": "macos-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that drives macOS desktop applications via Accessibility (AX) + ScreenCaptureKit (chrome-mcp pattern)",
+  "type": "module",
+  "bin": {
+    "macos-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "build:helper": "bash scripts/build-helper.sh",
+    "build:all": "npm run build:helper && npm run build",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "files": [
+    "dist",
+    "vendor",
+    "swift-helper/Sources",
+    "swift-helper/Package.swift",
+    "scripts/build-helper.sh"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "pngjs": "^7.0.0",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.23.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pngjs": "^6.0.5",
+    "typescript": "^5.6.0"
+  }
+}

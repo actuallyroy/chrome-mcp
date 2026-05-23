@@ -6,7 +6,8 @@
   "scripts": {
     "build:mcp": "node scripts/build-mcp.mjs",
     "build:android": "node scripts/build-android-mcp.mjs",
-    "prebuild": "npm run build:mcp && npm run build:android",
+    "build:macos": "node scripts/build-macos-mcp.mjs",
+    "prebuild": "npm run build:mcp && npm run build:android && npm run build:macos",
     "build": "next build",
     "dev": "next dev",
     "start": "next start",

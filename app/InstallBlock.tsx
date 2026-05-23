@@ -4,13 +4,13 @@ import { useState } from "react";
 
 type Props = {
   bootstrap: string;
-  product: "chrome" | "android";
+  product: "chrome" | "android" | "macos";
 };
 
 export default function InstallBlock({ bootstrap, product }: Props) {
   const [copied, setCopied] = useState(false);
 
-  const serverKey = product === "android" ? "android" : "chrome";
+  const serverKey = product;
   const config = JSON.stringify(
     {
       mcpServers: {
