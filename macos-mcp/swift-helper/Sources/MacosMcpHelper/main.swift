@@ -295,6 +295,61 @@ func dispatch(_ req: Request) async -> Response {
             out["actions"] = (actions as? [String]) ?? []
             return Response(id: req.id, result: AnyEncodable(out))
 
+        case "find_text":
+            let pid = (p["pid"] as? Int).map { Int32($0) }
+            let query = (p["text"] as? String) ?? ""
+            let accurate = (p["accurate"] as? Bool) ?? true
+            do {
+                let (img, origin, size) = try await Capture.captureForOCR(pid: pid)
+                let hits = try await OCR.recognize(cgImage: img, regionSize: size, regionOrigin: origin, accurate: accurate)
+                // Filter by query if provided (substring, case-insensitive).
+                let filtered: [OCR.TextHit] = query.isEmpty
+                    ? hits
+                    : hits.filter { $0.text.range(of: query, options: .caseInsensitive) != nil }
+                return Response(id: req.id, result: AnyEncodable([
+                    "hits": filtered,
+                    "total_hits": hits.count,
+                    "query": query,
+                ] as [String: Any]))
+            } catch {
+                return Response(id: req.id, error: .init(message: "find_text failed: \(error)"))
+            }
+
+        case "click_text":
+            guard let query = p["text"] as? String, !query.isEmpty else {
+                return Response(id: req.id, error: .init(message: "click_text: text required"))
+            }
+            let pid = (p["pid"] as? Int).map { Int32($0) }
+            let occ = (p["occurrence_index"] as? Int) ?? 0
+            let exact = (p["exact"] as? Bool) ?? false
+            do {
+                let (img, origin, size) = try await Capture.captureForOCR(pid: pid)
+                let hits = try await OCR.recognize(cgImage: img, regionSize: size, regionOrigin: origin)
+                let matches = hits.filter {
+                    exact ? $0.text == query : $0.text.range(of: query, options: .caseInsensitive) != nil
+                }
+                if matches.isEmpty {
+                    // Include up to 10 nearest-looking strings to help the agent retarget.
+                    let nearby = hits.prefix(20).map { ["text": $0.text, "x": $0.x, "y": $0.y] as [String: Any] }
+                    return Response(id: req.id, error: .init(message: "click_text: '\(query)' not found in screen OCR. \(hits.count) text regions seen. Nearby: \(nearby)"))
+                }
+                if occ >= matches.count {
+                    return Response(id: req.id, error: .init(message: "click_text: occurrence_index=\(occ) but only \(matches.count) matches"))
+                }
+                let hit = matches[occ]
+                let cx = hit.x + hit.width / 2
+                let cy = hit.y + hit.height / 2
+                Input.click(at: CGPoint(x: cx, y: cy))
+                return Response(id: req.id, result: AnyEncodable([
+                    "ok": true,
+                    "matched": hit.text,
+                    "x": cx, "y": cy,
+                    "total_matches": matches.count,
+                ] as [String: Any]))
+            } catch {
+                return Response(id: req.id, error: .init(message: "click_text failed: \(error)"))
+            }
+
         case "screenshot":
             let pid = (p["pid"] as? Int).map { Int32($0) }
             do {

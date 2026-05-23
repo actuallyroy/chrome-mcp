@@ -39,7 +39,7 @@ export function setNotifyToolsChanged(fn: () => void) { notifyToolsChanged = fn;
 function emitToolsChanged() { if (notifyToolsChanged) notifyToolsChanged(); }
 
 const FLOW_CAP = 20;
-const VERSION = "0.1.1";
+const VERSION = "0.2.0";
 
 // ---- AX outline renderer ----------------------------------------------------
 
@@ -470,6 +470,35 @@ export const tools: Tool[] = [
       }
       return json({ ok: false, status: "timeout", ms: Date.now() - start, polls, errors, mode, diff_hint: "tree kept changing — try mode='structure' or widen ignored attributes" });
     },
+  },
+
+  // ---- OCR-based locators (for apps with no AX tree: Zed/GPUI editors, Logic, Final Cut, Adobe, games) ----
+  {
+    name: "find_text",
+    description:
+      "OCR the current screen (or one app's foreground window when pid is set) via Apple Vision and return text hits with screen-point bounding boxes. " +
+      "Use when outline returns nothing useful — most commonly for Metal-rendered editors (Zed, SuperCodeEditor), Logic Pro, Final Cut, Adobe canvases, games. " +
+      "Filter by `text` (case-insensitive substring) or pass empty to get every recognized string.",
+    schema: z.object({
+      pid: z.number().int().optional().describe("Restrict capture to this app's foreground window. Falls back to full display if not found."),
+      text: z.string().default("").describe("Substring to filter for (case-insensitive). Empty = return all hits."),
+      accurate: z.boolean().default(true).describe("true = Vision's accurate recognizer (~80ms, better for code/UI). false = fast recognizer."),
+    }),
+    handler: async (args) => json(await callHelper("find_text", args)),
+  },
+  {
+    name: "click_text",
+    description:
+      "OCR the screen, find a text match, click its centre. " +
+      "Companion to `find_text`. When more than one match exists, pass `occurrence_index` (0-based, top-to-bottom-ish — depends on Vision's ordering). " +
+      "Returns the matched string + coordinates clicked, plus a list of nearby OCR hits on miss so the agent can retarget without another round-trip.",
+    schema: z.object({
+      text: z.string().min(1),
+      pid: z.number().int().optional(),
+      occurrence_index: z.number().int().min(0).default(0),
+      exact: z.boolean().default(false).describe("true = exact string equality (case-sensitive). false = case-insensitive substring."),
+    }),
+    handler: async (args) => json(await callHelper("click_text", args)),
   },
 
   // ---- Capture ----

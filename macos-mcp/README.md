@@ -89,14 +89,39 @@ helper re-spawns and re-checks its TCC grant).
 }
 ```
 
-## Current tool surface (v0.1.0)
+## Driving an app — three modes
 
-Minimum viable: ping, check_permissions, open_permissions_settings,
-list_apps, focus_app, launch_app, outline, click, screenshot.
+In order of preference:
 
-Next pass (planned, mirroring android-mcp): fill, hover, scroll, press_key,
-try_click, wait_for_element, wait_for_stable, describe, pause, run_script,
-save_flow / list_flows / delete_flow, send_feedback, recorder.
+1. **AX tree** (`outline`, `click { ref }`, `fill { ref }`, `describe`,
+   `try_click`, `wait_for_element`). Native AppKit, SwiftUI, Catalyst, and
+   Electron apps work here. Cheapest + most reliable.
+2. **Keyboard** (`press_key { key, modifiers }`, `type_text`). Works on
+   *every* app that responds to Cocoa shortcuts. Combine with screenshots
+   for verification — most code editors / dev tools live here.
+3. **OCR** (`find_text { text }`, `click_text { text }`). Apple Vision
+   recognizes everything on screen and returns bounding boxes; `click_text`
+   handles the find + click in one call. Use this for Metal-rendered apps
+   (Zed/GPUI editors, Logic, Final Cut), Adobe canvases, games — anything
+   with no AX exposure.
+
+See [ACCESSIBILITY.md](./ACCESSIBILITY.md) for how to make *your own* macOS
+app drivable (5 minutes of `accessibilityLabel` annotations buys you mode 1
+forever; cheaper than living on OCR).
+
+## Tool surface (v0.2.0)
+
+- **Permissions**: `check_permissions`, `open_permissions_settings`, `ping`
+- **App lifecycle**: `list_apps`, `focus_app`, `launch_app`
+- **AX inspection**: `outline`, `describe`
+- **AX interaction**: `click`, `fill`, `type_text`, `press_key`, `hover`,
+  `scroll`, `try_click`, `wait_for_element`, `wait_for_stable`
+- **OCR**: `find_text`, `click_text`
+- **Capture**: `screenshot` (full display or one app's window)
+- **Debug**: `pause`
+- **Flows**: `start_recording`, `stop_recording`, `recording_status`,
+  `run_script`, `save_flow`, `list_flows`, `delete_flow`
+- **Feedback**: `send_feedback` (uses your `gh` CLI when authed)
 
 ## Known limitations
 
