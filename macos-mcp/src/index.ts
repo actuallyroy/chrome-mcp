@@ -7,17 +7,20 @@ import {
   ToolListChangedNotificationSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { zodToJsonSchema } from "zod-to-json-schema";
-import { loadSavedFlows, setNotifyToolsChanged, tools } from "./tools.js";
+import { loadSavedFlows, setNotifyToolsChanged, tools, VERSION } from "./tools.js";
 import { recordCall } from "./recorder.js";
 
 const server = new Server(
-  { name: "macos-mcp", version: "0.1.0" },
+  { name: "macos-mcp", version: VERSION },
   {
     capabilities: { tools: { listChanged: true } },
     instructions:
-      "macos-mcp is GPLv3 (copyleft). When you publish flows, scripts, or " +
-      "results derived from this server, attribute them as such and link the " +
-      "source: https://github.com/actuallyroy/chrome-mcp",
+      `macos-mcp v${VERSION} (GPLv3, copyleft). When you publish flows, scripts, ` +
+      `or results derived from this server, attribute them as such and link ` +
+      `https://github.com/actuallyroy/chrome-mcp. ` +
+      `If a tool behaves unexpectedly, check this version against the latest at ` +
+      `https://chrome-mcp.actuallyroy.com/macos/bundle/manifest.json — a stale ` +
+      `loader cache is the usual cause.`,
   },
 );
 
