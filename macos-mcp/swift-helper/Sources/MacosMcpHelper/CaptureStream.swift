@@ -24,23 +24,34 @@ final class CaptureStream: NSObject, @unchecked Sendable, SCStreamOutput, SCStre
     private let ciContext = CIContext()
     private let outputQueue = DispatchQueue(label: "macos-mcp.capture-stream", qos: .userInitiated)
 
-    // Public: return the most recent full-display frame + its point-resolution
-    // size. Starts the stream if not running; waits up to 1s for the first
-    // frame to arrive.
+    // Non-blocking: return the latest frame if one is buffered, nil otherwise.
+    // Kicks off ensureStarted() in the background so the next call benefits.
+    // Callers should fall through to a cheaper fallback (e.g. CGDisplay-
+    // CreateImage) when this returns nil rather than waiting.
+    func latestOrNil() -> (CGImage, CGSize)? {
+        lock.lock()
+        let img = latestImage
+        let sz = displaySize
+        let started = (stream != nil)
+        lock.unlock()
+        if !started {
+            Task { try? await self.ensureStarted() }
+        }
+        if let img = img { return (img, sz) }
+        return nil
+    }
+
+    // Blocking variant: kept for paths that genuinely need a frame and can
+    // afford to wait. Polls up to 1s after starting the stream.
     func latest() async throws -> (CGImage, CGSize) {
         try await ensureStarted()
-
-        // Quick read.
         lock.lock()
         var img = latestImage
         let sz = displaySize
         lock.unlock()
-
         if let img = img { return (img, sz) }
-
-        // No frame buffered yet — first call after a fresh start. Poll.
         for _ in 0..<20 {
-            try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
+            try? await Task.sleep(nanoseconds: 50_000_000)
             lock.lock()
             img = latestImage
             lock.unlock()

@@ -63,7 +63,11 @@ enum Capture {
     private typealias CGDisplayCreateImageFn = @convention(c) (CGDirectDisplayID) -> Unmanaged<CGImage>?
     private static let cgDisplayCreateImageFn: CGDisplayCreateImageFn? = {
         // RTLD_DEFAULT == -2 cast to UnsafeMutableRawPointer
-        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGDisplayCreateImage") else { return nil }
+        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "CGDisplayCreateImage") else {
+            FileHandle.standardError.write("[macos-mcp-helper] CGDisplayCreateImage symbol NOT found — dlsym tier disabled\n".data(using: .utf8) ?? Data())
+            return nil
+        }
+        FileHandle.standardError.write("[macos-mcp-helper] CGDisplayCreateImage symbol resolved — dlsym tier enabled\n".data(using: .utf8) ?? Data())
         return unsafeBitCast(sym, to: CGDisplayCreateImageFn.self)
     }()
 
@@ -94,8 +98,8 @@ enum Capture {
             }
         }
 
-        // Tier 1: persistent stream.
-        if let (full, displaySz) = try? await CaptureStream.shared.latest() {
+        // Tier 1: persistent stream (non-blocking — kicks off warmup if not started).
+        if let (full, displaySz) = CaptureStream.shared.latestOrNil() {
             if let s = sizePts {
                 let cropRect = CGRect(x: origin.x, y: origin.y, width: s.width, height: s.height)
                 if let cropped = full.cropping(to: cropRect) {
@@ -157,8 +161,8 @@ enum Capture {
     }
 
     static func screenshot(pid: Int32? = nil) async throws -> Data {
-        // Tier 1: stream.
-        if let (full, _) = try? await CaptureStream.shared.latest() {
+        // Tier 1: stream (non-blocking).
+        if let (full, _) = CaptureStream.shared.latestOrNil() {
             var img = full
             if let pid = pid, let win = try? await firstFrontWindow(pid: pid) {
                 let cropRect = CGRect(x: win.frame.origin.x, y: win.frame.origin.y,

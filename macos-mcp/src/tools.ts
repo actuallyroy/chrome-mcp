@@ -39,7 +39,7 @@ export function setNotifyToolsChanged(fn: () => void) { notifyToolsChanged = fn;
 function emitToolsChanged() { if (notifyToolsChanged) notifyToolsChanged(); }
 
 const FLOW_CAP = 20;
-export const VERSION = "0.2.6";
+export const VERSION = "0.2.7";
 
 // ---- AX outline renderer ----------------------------------------------------
 
