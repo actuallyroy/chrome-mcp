@@ -39,7 +39,7 @@ export function setNotifyToolsChanged(fn: () => void) { notifyToolsChanged = fn;
 function emitToolsChanged() { if (notifyToolsChanged) notifyToolsChanged(); }
 
 const FLOW_CAP = 20;
-const VERSION = "0.2.3";
+const VERSION = "0.2.4";
 
 // ---- AX outline renderer ----------------------------------------------------
 
@@ -514,6 +514,20 @@ export const tools: Tool[] = [
       const r = await callHelper<{ png_base64: string }>("screenshot", pid ? { pid } : {});
       const resized = resizePngBase64(r.png_base64, max_dim);
       return { content: [{ type: "image", data: resized, mimeType: "image/png" }] };
+    },
+  },
+
+  // ---- Timing primitive ----
+  {
+    name: "wait",
+    description:
+      "Sleep for ms milliseconds. Use to give the UI time to settle after a focus / open / navigation step before the next click or type — most app responses are async, so back-to-back interaction calls often race. " +
+      "Most flows need 100-400 ms. Tools that touch the screen state (click, focus_app, press_key opening a panel) typically need a `wait` before the follow-up type_text / click.",
+    schema: z.object({ ms: z.number().int().min(1).max(60_000) }),
+    handler: async (args) => {
+      const { ms } = args as { ms: number };
+      await new Promise((r) => setTimeout(r, ms));
+      return text(`waited ${ms}ms`);
     },
   },
 

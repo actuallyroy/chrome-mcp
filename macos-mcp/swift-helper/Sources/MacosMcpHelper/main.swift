@@ -90,6 +90,21 @@ func paramsDict(_ req: Request) -> [String: Any] {
     return [:]
 }
 
+// JSON numbers come through as Int when whole, Double when fractional.
+// Tools that take coordinates need either — coerce safely.
+func numD(_ v: Any?) -> Double? {
+    if let d = v as? Double { return d }
+    if let i = v as? Int { return Double(i) }
+    if let n = v as? NSNumber { return n.doubleValue }
+    return nil
+}
+func numI(_ v: Any?) -> Int? {
+    if let i = v as? Int { return i }
+    if let d = v as? Double { return Int(d) }
+    if let n = v as? NSNumber { return n.intValue }
+    return nil
+}
+
 // MARK: - Dispatch
 
 func dispatch(_ req: Request) async -> Response {
@@ -180,7 +195,7 @@ func dispatch(_ req: Request) async -> Response {
                 Input.click(at: point, count: count)
                 return Response(id: req.id, result: AnyEncodable(["ok": true, "via": "cgevent", "x": point.x, "y": point.y] as [String: Any]))
             }
-            if let x = p["x"] as? Double, let y = p["y"] as? Double {
+            if let x = numD(p["x"]), let y = numD(p["y"]) {
                 let count = (p["count"] as? Int) ?? 1
                 let buttonStr = (p["button"] as? String) ?? "left"
                 let btn: CGMouseButton = buttonStr == "right" ? .right : .left
@@ -238,15 +253,15 @@ func dispatch(_ req: Request) async -> Response {
                 Input.moveMouse(to: CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2))
                 return Response(id: req.id, result: AnyEncodable(["ok": true]))
             }
-            if let x = p["x"] as? Double, let y = p["y"] as? Double {
+            if let x = numD(p["x"]), let y = numD(p["y"]) {
                 Input.moveMouse(to: CGPoint(x: x, y: y))
                 return Response(id: req.id, result: AnyEncodable(["ok": true]))
             }
             return Response(id: req.id, error: .init(message: "hover: pass ref OR (x,y)"))
 
         case "scroll":
-            let dx = Int32((p["dx"] as? Int) ?? 0)
-            let dy = Int32((p["dy"] as? Int) ?? -200)  // default scroll down
+            let dx = Int32(numI(p["dx"]) ?? 0)
+            let dy = Int32(numI(p["dy"]) ?? -200)  // default scroll down
             // If a ref is given, move the cursor over it first so the scroll
             // lands on the right scrollable region.
             if let ref = p["ref"] as? Int, let el = await AxRefStore.shared.resolve(ref),
