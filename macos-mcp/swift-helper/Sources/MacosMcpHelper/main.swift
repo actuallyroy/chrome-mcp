@@ -372,6 +372,10 @@ func dispatch(_ req: Request) async -> Response {
 struct HelperMain {
     static func main() async {
         log("started (pid=\(ProcessInfo.processInfo.processIdentifier))")
+        // Kick off the persistent capture stream so the first screenshot /
+        // find_text call hits a warm buffer. Fire-and-forget; failure is
+        // tolerable (Capture falls back to one-shot SCK).
+        CaptureStream.shared.warmup()
         let dec = JSONDecoder()
         while let line = readLine(strippingNewline: true) {
             if line.isEmpty { continue }

@@ -30,54 +30,75 @@ enum Capture {
     //
     // When pid is given and a window for that app is found, we crop to that
     // window's frame. Otherwise we capture the main display in full.
+    //
+    // Prefers the persistent CaptureStream (sub-10ms per call after the first)
+    // and falls back to one-shot SCScreenshotManager only if the stream fails.
     static func captureForOCR(pid: Int32? = nil) async throws -> (CGImage, CGPoint, CGSize) {
-        let content = try await freshContent()
-        guard let display = content.displays.first else { throw CaptureError.noDisplay }
-
-        // Try for the foreground window of the target pid so OCR text positions
-        // line up with where you'd actually want to click inside the app.
+        // Resolve crop rect (if any) from cached SCShareableContent so we can
+        // hand the caller the right origin/size for OCR coord math.
         var origin = CGPoint.zero
-        var sizePts = CGSize(width: display.width, height: display.height)
-        var filter: SCContentFilter
-
-        if let pid = pid,
-           let app = content.applications.first(where: { $0.processID == pid }),
-           let win = content.windows.first(where: { $0.owningApplication?.processID == pid && $0.frame.width > 100 }) {
-            filter = SCContentFilter(display: display, including: [app], exceptingWindows: [])
-            origin = win.frame.origin
-            sizePts = win.frame.size
-            _ = filter
-            // Capture the full display; we'll crop after.
-            filter = SCContentFilter(display: display, excludingWindows: [])
-        } else {
-            filter = SCContentFilter(display: display, excludingWindows: [])
+        var sizePts: CGSize? = nil
+        if let pid = pid {
+            do {
+                let content = try await freshContent()
+                if let win = content.windows.first(where: { $0.owningApplication?.processID == pid && $0.frame.width > 100 }) {
+                    origin = win.frame.origin
+                    sizePts = win.frame.size
+                }
+            } catch { /* fall through to full-display capture */ }
         }
 
+        // Fast path: persistent stream.
+        do {
+            let (full, displaySz) = try await CaptureStream.shared.latest()
+            if let s = sizePts {
+                let cropRect = CGRect(x: origin.x, y: origin.y, width: s.width, height: s.height)
+                if let cropped = full.cropping(to: cropRect) {
+                    return (cropped, origin, s)
+                }
+            }
+            return (full, .zero, displaySz)
+        } catch { /* fall back to one-shot */ }
+
+        return try await oneShotCaptureForOCR(pid: pid, origin: origin, sizePts: sizePts)
+    }
+
+    private static func oneShotCaptureForOCR(pid: Int32?, origin: CGPoint, sizePts: CGSize?) async throws -> (CGImage, CGPoint, CGSize) {
+        let content = try await freshContent()
+        guard let display = content.displays.first else { throw CaptureError.noDisplay }
+        let filter = SCContentFilter(display: display, excludingWindows: [])
         let cfg = SCStreamConfiguration()
-        // Point-resolution capture: width/height in pixels == display points
-        // for the OCR coord math to be 1:1. (We lose retina sharpness here,
-        // but Vision OCR is plenty accurate at this scale.)
         cfg.width = display.width
         cfg.height = display.height
         cfg.showsCursor = false
-
         let full = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
-
-        // Crop to the target window if we have one (origin / sizePts non-default).
-        if origin != .zero || sizePts != CGSize(width: display.width, height: display.height) {
-            let cropRect = CGRect(x: origin.x, y: origin.y, width: sizePts.width, height: sizePts.height)
-            if let cropped = full.cropping(to: cropRect) {
-                return (cropped, origin, sizePts)
-            }
+        if let s = sizePts {
+            let cropRect = CGRect(x: origin.x, y: origin.y, width: s.width, height: s.height)
+            if let cropped = full.cropping(to: cropRect) { return (cropped, origin, s) }
         }
         return (full, .zero, CGSize(width: display.width, height: display.height))
     }
 
     static func screenshot(pid: Int32? = nil) async throws -> Data {
+        // Fast path: persistent stream, crop if needed.
+        do {
+            let (full, displaySz) = try await CaptureStream.shared.latest()
+            var img = full
+            if let pid = pid {
+                let content = try await freshContent()
+                if let win = content.windows.first(where: { $0.owningApplication?.processID == pid && $0.frame.width > 100 }) {
+                    let cropRect = CGRect(x: win.frame.origin.x, y: win.frame.origin.y, width: win.frame.width, height: win.frame.height)
+                    if let cropped = full.cropping(to: cropRect) { img = cropped }
+                }
+            }
+            _ = displaySz
+            guard let png = pngData(from: img) else { throw CaptureError.encodingFailed }
+            return png
+        } catch { /* fall through */ }
+
+        // Fallback: one-shot SCK with retina dimensions.
         let content = try await freshContent()
         guard let display = content.displays.first else { throw CaptureError.noDisplay }
-
-        // If a pid is specified, restrict to that app's windows; otherwise full display.
         let filter: SCContentFilter
         if let pid = pid,
            let app = content.applications.first(where: { $0.processID == pid }) {
@@ -85,12 +106,10 @@ enum Capture {
         } else {
             filter = SCContentFilter(display: display, excludingWindows: [])
         }
-
         let cfg = SCStreamConfiguration()
-        cfg.width = display.width * 2  // retina
+        cfg.width = display.width * 2
         cfg.height = display.height * 2
         cfg.showsCursor = false
-
         let img = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: cfg)
         guard let png = pngData(from: img) else { throw CaptureError.encodingFailed }
         return png
