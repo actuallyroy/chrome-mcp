@@ -21,8 +21,6 @@ final class CaptureStream: NSObject, @unchecked Sendable, SCStreamOutput, SCStre
     private var latestImage: CGImage?
     private var displaySize: CGSize = .zero
     private let lock = NSLock()
-    private var lastAccess: Date = .distantPast
-    private var idleTimer: Timer?
     private let ciContext = CIContext()
     private let outputQueue = DispatchQueue(label: "macos-mcp.capture-stream", qos: .userInitiated)
 
@@ -36,7 +34,6 @@ final class CaptureStream: NSObject, @unchecked Sendable, SCStreamOutput, SCStre
         lock.lock()
         var img = latestImage
         let sz = displaySize
-        lastAccess = Date()
         lock.unlock()
 
         if let img = img { return (img, sz) }
@@ -81,40 +78,17 @@ final class CaptureStream: NSObject, @unchecked Sendable, SCStreamOutput, SCStre
         lock.lock()
         stream = s
         displaySize = CGSize(width: display.width, height: display.height)
-        lastAccess = Date()
         lock.unlock()
-
-        startIdleWatcher()
     }
 
-    private func startIdleWatcher() {
-        DispatchQueue.main.async { [weak self] in
-            self?.idleTimer?.invalidate()
-            let t = Timer(timeInterval: 15, repeats: true) { [weak self] _ in
-                guard let self = self else { return }
-                self.lock.lock()
-                let idle = Date().timeIntervalSince(self.lastAccess)
-                self.lock.unlock()
-                if idle > 60 { self.stop() }
-            }
-            // Use common modes so the timer fires even when no Cocoa runloop
-            // event source is active.
-            RunLoop.main.add(t, forMode: .common)
-            self?.idleTimer = t
-        }
-    }
-
-    func stop() {
+    // Force-restart on display reconfig (monitor plug/unplug, resolution change).
+    func restart() {
         lock.lock()
         let s = stream
         stream = nil
         latestImage = nil
         lock.unlock()
         Task { try? await s?.stopCapture() }
-        DispatchQueue.main.async { [weak self] in
-            self?.idleTimer?.invalidate()
-            self?.idleTimer = nil
-        }
     }
 
     // Fire-and-forget warmup. Called once at helper boot so the user's first
