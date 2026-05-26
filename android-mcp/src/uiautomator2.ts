@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { adb, adbShell, adbSpawn, getActiveSerial } from "./adb.js";
+import { adb, adbShell, adbSpawn, getActiveSerial, screenSize } from "./adb.js";
 import { ensureDevice } from "./devices.js";
 
 // Default Appium UIAutomator2 server port (on device).
@@ -234,7 +234,11 @@ export async function ensureSession(): Promise<string> {
   await startServer(dev.serial);
   await waitForServer();
   // UiAutomation finishes wiring up a bit after HTTP is ready — retry session creation.
+  // If the server responds but reports "UiAutomation not connected" (zombie
+  // instrumentation — process alive, handle id=-1) plain retries won't help.
+  // Force a teardown + reinstrument before the next attempt.
   let lastErr: unknown = null;
+  let reinstrumented = false;
   for (let attempt = 0; attempt < 6; attempt++) {
     try {
       sessionId = await createSession();
@@ -242,6 +246,21 @@ export async function ensureSession(): Promise<string> {
       return sessionId;
     } catch (e) {
       lastErr = e;
+      const msg = (e as Error).message || "";
+      if (/UiAutomation not connected/.test(msg) && !reinstrumented) {
+        log("UiAutomation handle dead — force-stopping server and reinstrumenting");
+        try {
+          await adb(["-s", dev.serial, "shell", `am force-stop ${SERVER_PKG}`]);
+          await adb(["-s", dev.serial, "shell", `am force-stop ${SERVER_TEST_PKG}`]);
+        } catch { /* ignore */ }
+        if (serverProc && !serverProc.killed) {
+          try { serverProc.kill("SIGKILL"); } catch { /* ignore */ }
+        }
+        serverProc = null;
+        await startServer(dev.serial);
+        await waitForServer();
+        reinstrumented = true;
+      }
       await new Promise((r) => setTimeout(r, 1000 + attempt * 500));
     }
   }
@@ -397,6 +416,12 @@ const DEV_BADGE_SIGNALS = [
   "[NOTIFICATION",
   "[StartDay]",
   "[StoreDetailsScreen]",
+  "[SplashScreen]",
+  "[SyncService]",
+  "Token refresh failed",
+  "performSync",
+  "Error stack:",
+  "is not a valid icon name",
   "StoreService",
   "getProductsUnified",
   "Encountered two children",
@@ -560,6 +585,84 @@ export async function dismissDevOverlay(): Promise<{
       await new Promise((r) => setTimeout(r, 300));
       const recurse = await dismissDevOverlay();
       return { full_screen: true, badges_dismissed: recurse.badges_dismissed };
+    }
+
+    // Structural LogBox toast detection. On Android, RN's `id="logbox_*"`
+    // props become View tags — NOT resource-id — so UIAutomator can't see
+    // them. The visible text is also typically not in the AX tree (RN's
+    // <Text> in the toast is rendered without accessibility exposure).
+    // What IS reliable is the shape:
+    //   - bottom-pinned full-width ViewGroup
+    //   - containing a tiny ViewGroup pinned to its right edge
+    //   - which has exactly one ImageView descendant and no text
+    // That tiny right-edge group is the dismiss button.
+    //
+    // Snackbar action buttons have TEXT (e.g. "UNDO"), bottom nav has
+    // multiple buttons across the width, FABs aren't inside a full-width
+    // bottom container — so this shape is specific to LogBox toasts.
+    const { h: screenH, w: screenW } = await screenSize().catch(() => ({ h: 0, w: 0 }));
+    if (screenH > 0 && screenW > 0) {
+      type DismissHit = { tapX: number; tapY: number; parentTop: number };
+      const dismissHits: DismissHit[] = [];
+      const bottomThreshold = Math.floor(screenH * 0.75);
+
+      function hasText(n: XmlNode): boolean {
+        if ((n.attrs.text || "").trim()) return true;
+        if ((n.attrs["content-desc"] || "").trim()) return true;
+        for (const c of n.children) if (hasText(c)) return true;
+        return false;
+      }
+      function countImageViews(n: XmlNode): number {
+        let count = (n.attrs.class || "").endsWith("ImageView") ? 1 : 0;
+        for (const c of n.children) count += countImageViews(c);
+        return count;
+      }
+      function isViewGroup(n: XmlNode): boolean {
+        const cls = n.attrs.class || "";
+        return cls.endsWith("ViewGroup") || cls === "android.view.ViewGroup";
+      }
+
+      (function walkLogBox(n: XmlNode) {
+        const b = parseBounds(n.attrs.bounds || "");
+        if (b && isViewGroup(n)) {
+          // Outer must be bottom-pinned, roughly full-width, and have no
+          // content-desc of its own (LogBox container is unlabeled; the
+          // bottom-nav wrapper rows have descs like "5, , Return Pickup,").
+          const isBottom = b.t >= bottomThreshold;
+          const isWide = b.r - b.l >= screenW * 0.7;
+          const isUnlabeled = !(n.attrs["content-desc"] || "").trim();
+          if (isBottom && isWide && isUnlabeled) {
+            for (const c of n.children) {
+              const cb = parseBounds(c.attrs.bounds || "");
+              if (!cb || !isViewGroup(c)) continue;
+              const isRightEdge = b.r - cb.r <= 80;
+              const isNarrow = cb.r - cb.l <= 120;
+              if (!isRightEdge || !isNarrow) continue;
+              if (countImageViews(c) !== 1) continue;
+              if (hasText(c)) continue;
+              dismissHits.push({
+                tapX: Math.round((cb.l + cb.r) / 2),
+                tapY: Math.round((cb.t + cb.b) / 2),
+                parentTop: b.t,
+              });
+            }
+          }
+        }
+        // Always recurse — nested ViewGroups may also be candidates (LogBox is
+        // wrapped inside the app's outer layout wrappers).
+        for (const c of n.children) walkLogBox(c);
+      })(root);
+
+      if (dismissHits.length > 0) {
+        // Dismiss from the top down so each tap's coords stay valid as
+        // badges below shift up.
+        const sorted = dismissHits.sort((a, b) => a.parentTop - b.parentTop);
+        for (const hit of sorted) {
+          await tap(hit.tapX, hit.tapY);
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        return { full_screen: false, badges_dismissed: dismissHits.length };
+      }
     }
 
     // Deduplicate by bounds (same badge can appear multiple times in the tree
