@@ -582,7 +582,7 @@ export const tools: Tool[] = [
   {
     name: "dismiss_dev_overlay",
     description:
-      "Dismiss React Native LogBox dev overlays (full-screen stack-trace view and minimized warning badges). Called automatically before every interactive tool; expose as an explicit tool for debugging.",
+      "Dismiss React Native LogBox dev overlays (full-screen stack-trace view and minimized warning badges). Called automatically before and after every interactive tool (after a short settle, so badges spawned by the action are cleared too); expose as an explicit tool for debugging.",
     schema: z.object({}),
     handler: async () => json(await dismissDevOverlay()),
   },
