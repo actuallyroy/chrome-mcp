@@ -22,6 +22,10 @@ public/macos/bundle/
 public/macos/vendor/
 public/macos/loader.mjs
 public/macos/bootstrap.min.js
+public/windows/bundle/
+public/windows/vendor/
+public/windows/loader.mjs
+public/windows/bootstrap.min.js
 public/bootstrap.min.js
 android-mcp/dist/
 android-mcp/package-lock.json
@@ -29,4 +33,11 @@ macos-mcp/dist/
 macos-mcp/package-lock.json
 macos-mcp/node_modules/
 macos-mcp/swift-helper/.build/
+windows-mcp/dist/
+windows-mcp/node_modules/
+windows-mcp/package-lock.json
+windows-mcp/vendor/
+windows-mcp/vendor-sandbox/
+windows-mcp/csharp-helper/bin/
+windows-mcp/csharp-helper/obj/
 .env

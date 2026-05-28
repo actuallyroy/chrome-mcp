@@ -1,0 +1,34 @@
+{
+  "name": "windows-mcp",
+  "version": "0.1.0",
+  "description": "MCP server that drives Windows desktop applications via UI Automation + Windows.Media.Ocr (chrome-mcp pattern)",
+  "type": "module",
+  "bin": {
+    "windows-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "build:helper": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-helper.ps1",
+    "build:all": "npm run build:helper && npm run build",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js"
+  },
+  "files": [
+    "dist",
+    "vendor",
+    "csharp-helper",
+    "scripts/build-helper.ps1"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "pngjs": "^7.0.0",
+    "zod": "^3.23.8",
+    "zod-to-json-schema": "^3.23.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pngjs": "^6.0.5",
+    "typescript": "^5.6.0"
+  }
+}

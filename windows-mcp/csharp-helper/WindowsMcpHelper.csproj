@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows10.0.19041.0</TargetFramework>
+    <RootNamespace>WindowsMcpHelper</RootNamespace>
+    <AssemblyName>windows-mcp-helper</AssemblyName>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- UIA is part of the WPF assemblies (UIAutomationClient.dll). -->
+    <UseWPF>true</UseWPF>
+
+    <!-- Publish-time defaults.
+         FRAMEWORK-DEPENDENT: ship a small (~3 MB) single-file exe that
+         requires .NET 8 Desktop Runtime on the user's machine. Trade-off
+         vs. self-contained (~190 MB): users install Microsoft's runtime
+         once, but every windows-mcp update stays small and Vercel-hosted. -->
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>false</SelfContained>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <DebugType>embedded</DebugType>
+    <!-- Trimming a WPF app is unsupported in .NET 8; we ship untrimmed. -->
+    <PublishTrimmed>false</PublishTrimmed>
+    <!-- Globalization stays ON: Windows.Media.Ocr looks up language packs
+         via globalization tables and silently returns no engine when invariant
+         mode is set, which breaks find_text / click_text inside Sandbox. -->
+    <InvariantGlobalization>false</InvariantGlobalization>
+
+    <!-- Stdin/stdout must be raw UTF-8 — see Program.cs. -->
+    <ServerGarbageCollection>true</ServerGarbageCollection>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Drawing.Common" Version="8.0.10" />
+  </ItemGroup>
+
+  <!-- Sandbox profile: same csproj produces a self-contained, multi-file
+       publish suitable for shipping inside Windows Sandbox. Activate via:
+         dotnet publish -p:SandboxBuild=true -c Release -r win-x64
+       PublishSingleFile is intentionally false: a single-file bundle has to
+       extract to %TEMP%\.net on every cold start, which the ephemeral sandbox
+       can't cache between sessions. Multi-file publish is launch-ready. -->
+  <PropertyGroup Condition="'$(SandboxBuild)' == 'true'">
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>false</PublishSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>false</IncludeNativeLibrariesForSelfExtract>
+  </PropertyGroup>
+
+</Project>
