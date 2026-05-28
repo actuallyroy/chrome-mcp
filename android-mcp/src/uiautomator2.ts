@@ -427,6 +427,16 @@ const DEV_BADGE_SIGNALS = [
 // If a badge appears with content we don't recognize, the agent can call
 // dismiss_dev_overlay explicitly — better than silently tapping app buttons.
 
+// The minimized LogBox *warning* badge (single "!" glyph, no error count)
+// encodes its content-desc as "!, <message>" — the leading "!" is the warning
+// icon that the accessibility tree joins to the message text with ", ". Match
+// that exact prefix. Unlike the old "<digit>, " heuristic (which false-matched
+// numbered app rows like "1, , Preparation, "), a content-desc beginning with
+// "!," is specific to LogBox, so it's safe to treat as a dev badge.
+function isLogBoxWarningDesc(desc: string): boolean {
+  return /^\s*!,/.test(desc);
+}
+
 type XmlNode = {
   attrs: Record<string, string>;
   children: XmlNode[];
@@ -529,7 +539,7 @@ export async function dismissDevOverlay(): Promise<{
         b &&
         desc &&
         b.t >= 1800 && // Badges are pinned near the bottom; avoid false positives mid-screen.
-        DEV_BADGE_SIGNALS.some((sig) => desc.includes(sig))
+        (DEV_BADGE_SIGNALS.some((sig) => desc.includes(sig)) || isLogBoxWarningDesc(desc))
       ) {
         matches.push({ desc, bounds: b });
       }
