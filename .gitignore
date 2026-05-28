@@ -41,3 +41,4 @@ windows-mcp/vendor-sandbox/
 windows-mcp/csharp-helper/bin/
 windows-mcp/csharp-helper/obj/
 .env
+.claude/settings.local.json
