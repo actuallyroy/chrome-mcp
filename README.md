@@ -1,6 +1,6 @@
-# chrome-mcp + android-mcp
+# chrome-mcp + android-mcp + macos-mcp + windows-mcp
 
-Two MCP servers that drive your **real** tooling from Claude Code — Chrome (via CDP) and Android devices (via UIAutomator2). Same architecture, same distribution: semantic locators, live pause/inject, flow record/replay, one-line install.
+Four MCP servers that drive your **real** tooling from Claude Code — Chrome (via CDP), Android devices (via UIAutomator2), macOS desktop apps (via AX + ScreenCaptureKit), and Windows desktop apps (via UI Automation + SendInput). Same architecture, same distribution: semantic locators, live pause/inject, flow record/replay, one-line install.
 
 Distributed via [chrome-mcp.actuallyroy.com](https://chrome-mcp.actuallyroy.com). The site hosts both bundled servers + tiny zero-dep loaders that handle install, updates, and SHA-256 tamper detection.
 
@@ -90,9 +90,21 @@ See [`examples/demo.flow.json`](./examples/demo.flow.json) for a sample `run_scr
 │   │   ├── recorder.ts        # copied from mcp-server/
 │   │   └── index.ts
 │   └── package.json
+├── macos-mcp/                 # macos-mcp Node + Swift sidecar
+│   ├── src/
+│   ├── swift-helper/          # AX + ScreenCaptureKit Swift sidecar
+│   ├── scripts/build-helper.sh
+│   └── package.json
+├── windows-mcp/               # windows-mcp Node + C# sidecar
+│   ├── src/
+│   ├── csharp-helper/         # UI Automation + SendInput .NET 8 sidecar
+│   ├── scripts/build-helper.ps1
+│   └── package.json
 ├── scripts/
 │   ├── build-mcp.mjs          # builds chrome bundle + manifest
 │   ├── build-android-mcp.mjs  # builds android bundle + manifest + fetches UIAutomator2 APKs
+│   ├── build-macos-mcp.mjs    # builds macos bundle + manifest + Swift helper
+│   ├── build-windows-mcp.mjs  # builds windows bundle + manifest + C# helper
 │   ├── launch-chrome.sh
 │   └── launch-chrome.ps1
 ├── examples/
@@ -106,7 +118,17 @@ See [`examples/demo.flow.json`](./examples/demo.flow.json) for a sample `run_scr
     ├── android/loader.mjs
     ├── android/bootstrap.min.js
     ├── android/vendor/uiautomator2-server.apk
-    └── android/vendor/uiautomator2-server-test.apk
+    ├── android/vendor/uiautomator2-server-test.apk
+    ├── macos/bundle/v<version>.mjs
+    ├── macos/bundle/manifest.json
+    ├── macos/loader.mjs
+    ├── macos/bootstrap.min.js
+    ├── macos/vendor/macos-mcp-helper
+    ├── windows/bundle/v<version>.mjs
+    ├── windows/bundle/manifest.json
+    ├── windows/loader.mjs
+    ├── windows/bootstrap.min.js
+    └── windows/vendor/windows-mcp-helper.exe
 ```
 
 ### android-mcp quick reference

@@ -4,7 +4,7 @@ import { useState } from "react";
 
 type Props = {
   bootstrap: string;
-  product: "chrome" | "android" | "macos";
+  product: "chrome" | "android" | "macos" | "windows";
 };
 
 export default function InstallBlock({ bootstrap, product }: Props) {

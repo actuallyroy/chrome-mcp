@@ -28,17 +28,19 @@ export default function Page() {
   const chromeManifest = readManifest("bundle/manifest.json");
   const androidManifest = readManifest("android/bundle/manifest.json");
   const macosManifest = readManifest("macos/bundle/manifest.json");
+  const windowsManifest = readManifest("windows/bundle/manifest.json");
   const chromeBootstrap = read("bootstrap.min.js")?.trim() ?? "";
   const androidBootstrap = read("android/bootstrap.min.js")?.trim() ?? "";
   const macosBootstrap = read("macos/bootstrap.min.js")?.trim() ?? "";
+  const windowsBootstrap = read("windows/bootstrap.min.js")?.trim() ?? "";
 
   return (
     <main>
-      <h1>Drive real Chrome + Android from Claude Code</h1>
+      <h1>Drive real Chrome, Android, macOS, and Windows from Claude Code</h1>
       <p className="tagline">
-        Two MCP servers that let an agent tap, type, and reason through your actual apps — the
-        browser you're logged into and the device in your hand. No headless sandbox, no fragile
-        selectors, no install script.
+        MCP servers that let an agent tap, type, and reason through your actual apps — the
+        browser you're logged into, the device in your hand, and the desktop in front of you. No
+        headless sandbox, no fragile selectors, no install script.
       </p>
 
       <section>
@@ -123,6 +125,42 @@ export default function Page() {
             {macosManifest.helper && (
               <>
                 {" "}· <a href="/macos/vendor/macos-mcp-helper">Swift helper</a>
+              </>
+            )}
+          </p>
+        )}
+      </section>
+
+      <section>
+        <h2>
+          windows-mcp{" "}
+          {windowsManifest && <span className="meta">v{windowsManifest.version}</span>}
+          {windowsManifest?.helper && (
+            <span className="meta"> · C# helper {(windowsManifest.helper.size_bytes / 1024 / 1024).toFixed(1)} MB</span>
+          )}
+        </h2>
+        <p>
+          Drives any Windows desktop app — Win32, WPF, WinForms, WinUI 3, UWP, Edge / Chrome / Electron
+          (with ARIA) — through the UI Automation tree. Same locator ergonomics (text, role,
+          AutomationId). Synthesizes <code>SendInput</code> mouse + keyboard, grabs PNG screenshots
+          via <code>PrintWindow</code>, runs OCR through built-in <code>Windows.Media.Ocr</code> for
+          apps with no UIA tree (custom canvases, games). Bundled C# helper exe; Windows 10 1903+
+          (x64); requires <strong>.NET 8 Desktop Runtime</strong> (Microsoft-signed,{" "}
+          <a href="https://aka.ms/dotnet/8.0/windowsdesktop-runtime-win-x64.exe">~55 MB install</a> —
+          windows-mcp prints a clear hint on first run if it's missing).
+        </p>
+        <h3>Paste into <code>~/.claude.json</code> and restart Claude Code:</h3>
+        <InstallBlock bootstrap={windowsBootstrap} product="windows" />
+        {windowsManifest && (
+          <p className="hash">
+            sha256: {windowsManifest.sha256}
+            <br />
+            <a href={`/windows/bundle/v${windowsManifest.version}.mjs`}>bundle</a> ·{" "}
+            <a href="/windows/bundle/manifest.json">manifest</a> ·{" "}
+            <a href="/windows/loader.mjs">loader.mjs</a>
+            {windowsManifest.helper && (
+              <>
+                {" "}· <a href="/windows/vendor/windows-mcp-helper.exe">C# helper exe</a>
               </>
             )}
           </p>
