@@ -158,6 +158,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           result.content.push({ type: "text", text: note });
         }
       }
+      // A LogBox badge spawned by this action often renders only after the
+      // screen settles — later than the eager dismiss above. Without a second
+      // pass it survives into the user's next screenshot/assert (which skip
+      // auto-dismiss), corrupting the result (issue #24). Now that the
+      // post-action UI has settled, clear any late-appearing badge.
+      try { await dismissDevOverlay(); } catch { /* best-effort */ }
     }
     const preview = result.content.find((c) => c.type === "text")?.text;
     recordCall(tool.name, args, !result.isError, preview);
