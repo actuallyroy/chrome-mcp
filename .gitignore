@@ -23,7 +23,12 @@ public/macos/vendor/
 public/macos/loader.mjs
 public/macos/bootstrap.min.js
 public/windows/bundle/
-public/windows/vendor/
+# vendor/ is build output, EXCEPT the committed binaries we host directly on
+# Vercel (the helper exe + the sandbox zip) so a pasted install can download them
+# without a GitHub Release. The build references these committed files on Linux.
+public/windows/vendor/*
+!public/windows/vendor/windows-mcp-helper.exe
+!public/windows/vendor/*.zip
 public/windows/loader.mjs
 public/windows/bootstrap.min.js
 public/bootstrap.min.js

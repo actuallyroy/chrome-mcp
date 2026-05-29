@@ -95,6 +95,19 @@ if (helperBytes) {
     size_bytes: helperBytes.length,
     requires_runtime: "Microsoft.WindowsDesktop.App 8.0+",
   };
+} else if (existsSync(join(VENDOR_DIR, "windows-mcp-helper.exe"))) {
+  // Committed-to-public path: the helper exe is checked into public/windows/vendor/
+  // and served by Vercel directly. Hash the committed file so the manifest points at
+  // it. This is the Linux/Vercel path (no source exe is built there).
+  const hb = readFileSync(join(VENDOR_DIR, "windows-mcp-helper.exe"));
+  helperManifest = {
+    arch: "x64",
+    url: "/windows/vendor/windows-mcp-helper.exe",
+    sha256: createHash("sha256").update(hb).digest("hex"),
+    size_bytes: hb.length,
+    requires_runtime: "Microsoft.WindowsDesktop.App 8.0+",
+  };
+  console.log("helper: using committed public/windows/vendor/windows-mcp-helper.exe");
 } else {
   const sidecarPath = join(MCP_DIR, "helper-release.json");
   if (existsSync(sidecarPath)) {
@@ -195,6 +208,25 @@ if (!sandboxBundle) {
     } catch (e) {
       console.warn(`WARN: sandbox-release.json present but unusable (${e.message}). Manifest sandbox_bundle = null.`);
     }
+  }
+}
+
+// 3d. Committed-to-public fallback for the sandbox payload. If the zip is checked
+//     into public/windows/vendor/ (served by Vercel directly), hash it so the
+//     manifest references it. This is the Linux/Vercel path - mirrors the helper.
+if (!sandboxBundle) {
+  const committedZip = join(VENDOR_DIR, `windows-mcp-sandbox-v${version}.zip`);
+  if (existsSync(committedZip)) {
+    const zb = readFileSync(committedZip);
+    sandboxBundle = {
+      version,
+      url: `/windows/vendor/windows-mcp-sandbox-v${version}.zip`,
+      sha256: createHash("sha256").update(zb).digest("hex"),
+      size_bytes: zb.length,
+      file_count_unpacked: null,
+      requires_os: "Windows 10/11 Pro/Enterprise/Education with Windows Sandbox feature enabled",
+    };
+    console.log(`sandbox: using committed public/windows/vendor/windows-mcp-sandbox-v${version}.zip`);
   }
 }
 
