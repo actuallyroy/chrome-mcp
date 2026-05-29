@@ -695,6 +695,26 @@ export const tools: Tool[] = [
       // what kept changing.
       let finalCur = "";
       try { finalCur = await dumpSource(); } catch { /* ignore */ }
+      const finalNorm = normalize(finalCur);
+      // If the screen is in fact unchanged at the deadline (the final snapshot
+      // normalizes identical to the previous one), it has settled. Raw-XML
+      // jitter earlier in the window can keep `consecutive` from ever reaching
+      // `stable_polls`, producing a misleading "timeout" on a screen that is
+      // genuinely stable — exactly the case the diff_hint reports as
+      // "(identical after normalize)". Treat an empty final diff as stable
+      // (issue #26).
+      if (finalNorm && finalNorm === prevNorm) {
+        return json({
+          ok: true,
+          status: "stable",
+          ms: Date.now() - start,
+          polls,
+          consecutive_matches: consecutive + 1,
+          dump_errors,
+          mode,
+          note: "settled at deadline — final snapshot identical after normalize despite earlier raw-XML jitter",
+        });
+      }
       return json({
         ok: false,
         status: "timeout",
@@ -703,7 +723,7 @@ export const tools: Tool[] = [
         consecutive_matches: consecutive + 1,
         dump_errors,
         mode,
-        diff_hint: summarizeDiff(normalize(prevRaw), normalize(finalCur)),
+        diff_hint: summarizeDiff(normalize(prevRaw), finalNorm),
       });
     },
   },
