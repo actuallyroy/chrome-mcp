@@ -167,6 +167,37 @@ if (existsSync(sandboxSrcDir) && process.platform === "win32") {
   console.log(`(no vendor-sandbox/ — run 'powershell scripts/build-helper.ps1 -Sandbox' inside windows-mcp/ to produce it)`);
 }
 
+// 3c. Sidecar fallback for the sandbox payload. Off-Windows build hosts
+//     (Vercel/Linux) can't zip vendor-sandbox/ or compute its SHA, so 3b leaves
+//     sandbox_bundle null and the deployed manifest ships without it — which
+//     makes start_sandbox fail with "manifest has no sandbox_bundle" once a
+//     client reconnects to the deployed loader (issue #32). Mirror the helper
+//     handling (3a): if an operator has committed windows-mcp/sandbox-release.json
+//     pointing at the externally-hosted zip (url + sha256), use it.
+if (!sandboxBundle) {
+  const sandboxSidecar = join(MCP_DIR, "sandbox-release.json");
+  if (existsSync(sandboxSidecar)) {
+    try {
+      const sc = JSON.parse(readFileSync(sandboxSidecar, "utf8"));
+      // Accept either the bundle object directly or one wrapped under a
+      // `sandbox_bundle` key.
+      const sb = sc && sc.sandbox_bundle ? sc.sandbox_bundle : sc;
+      if (!sb || !sb.url || !sb.sha256) throw new Error("missing url or sha256");
+      sandboxBundle = {
+        version: sb.version || version,
+        url: sb.url,
+        sha256: sb.sha256,
+        size_bytes: sb.size_bytes ?? null,
+        file_count_unpacked: sb.file_count_unpacked ?? null,
+        requires_os: sb.requires_os || "Windows 10/11 Pro/Enterprise/Education with Windows Sandbox feature enabled",
+      };
+      console.log(`sandbox: using committed sandbox-release.json -> ${sb.url}`);
+    } catch (e) {
+      console.warn(`WARN: sandbox-release.json present but unusable (${e.message}). Manifest sandbox_bundle = null.`);
+    }
+  }
+}
+
 // 4. Manifest.
 const manifest = {
   product: "windows-mcp",
