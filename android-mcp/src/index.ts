@@ -49,11 +49,11 @@ const SKIP_AUTO_DISMISS = new Set<string>([
 ]);
 
 // Track consecutive non-batched tool calls. When the agent runs a streak of
-// individual calls, nudge them toward `run_script` inline batching once.
+// individual calls, nudge them toward `run_script` inline batching — at most
+// once per session, since repeated hints just burn tokens (issue #28).
 const BATCH_NUDGE_THRESHOLD = 10;
-const BATCH_NUDGE_COOLDOWN = 15;
 let consecutiveSingleCalls = 0;
-let callsSinceLastNudge = Infinity;
+let batchNudgeShown = false;
 const BATCH_NUDGE = `\n\n[hint] You've made ${BATCH_NUDGE_THRESHOLD}+ tool calls in a row. When you're confident about the next 2-3 steps, batch them with \`run_script { script: { steps: [{tool, args}, ...] } }\` to save round-trips. It stops at the first failure and the report tells you which step \`i\` to resume at.`;
 
 // Track repeated failures per tool. After 2 consecutive failures of the same
@@ -175,21 +175,20 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     } else {
       lastFailures.set(tool.name, 0);
     }
-    // Batching nudge: increment the streak unless this call IS a batch.
+    // Batching nudge: increment the streak unless this call IS a batch. Show
+    // the hint at most once per session.
     if (tool.name === "run_script") {
       consecutiveSingleCalls = 0;
     } else {
       consecutiveSingleCalls++;
-      callsSinceLastNudge++;
-      if (consecutiveSingleCalls >= BATCH_NUDGE_THRESHOLD && callsSinceLastNudge >= BATCH_NUDGE_COOLDOWN) {
+      if (!batchNudgeShown && consecutiveSingleCalls >= BATCH_NUDGE_THRESHOLD) {
         const firstText = result.content.find((c) => c.type === "text");
         if (firstText && typeof firstText.text === "string") {
           firstText.text = firstText.text + BATCH_NUDGE;
         } else {
           result.content.push({ type: "text", text: BATCH_NUDGE.trimStart() });
         }
-        callsSinceLastNudge = 0;
-        consecutiveSingleCalls = 0;
+        batchNudgeShown = true;
       }
     }
     return result;
