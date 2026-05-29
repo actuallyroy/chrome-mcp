@@ -19,8 +19,17 @@ internal static class Input
     {
         var ix = (int)Math.Round(x);
         var iy = (int)Math.Round(y);
+        // SetCursorPos moves the OS cursor (so hit-testing on the button-down is
+        // correct), but on its own it does NOT reliably deliver a WM_MOUSEMOVE to
+        // the target window. Many UI toolkits (winit/wgpu, SDL, GLFW) derive a
+        // click's location from the last cursor-move event, not from the button
+        // event — so a button-down with no preceding move lands at the toolkit's
+        // stale position and silently no-ops, while keyboard input still lands.
+        // Inject an explicit absolute move first, then let the app process it, so
+        // the click registers at the intended point.
         Native.SetCursorPos(ix, iy);
-        Thread.Sleep(10);
+        SendAbsoluteMove(ix, iy);
+        Thread.Sleep(16);
         uint down, up;
         if (string.Equals(button, "right", StringComparison.OrdinalIgnoreCase))
         {
@@ -42,6 +51,27 @@ internal static class Input
             Native.SendInput((uint)inputs.Length, inputs, System.Runtime.InteropServices.Marshal.SizeOf<Native.INPUT>());
             if (i + 1 < count) Thread.Sleep(20);
         }
+    }
+
+    // Deliver a real WM_MOUSEMOVE to whatever window is under (x,y) by injecting
+    // an absolute move. MOUSEEVENTF_ABSOLUTE coordinates are normalized to
+    // 0..65535 across the virtual desktop, so map physical screen pixels onto
+    // that range (matching the virtual-screen metrics used by capture/OCR).
+    private static void SendAbsoluteMove(int x, int y)
+    {
+        var vx = Native.GetSystemMetrics(Native.SM_XVIRTUALSCREEN);
+        var vy = Native.GetSystemMetrics(Native.SM_YVIRTUALSCREEN);
+        var vw = Native.GetSystemMetrics(Native.SM_CXVIRTUALSCREEN);
+        var vh = Native.GetSystemMetrics(Native.SM_CYVIRTUALSCREEN);
+        if (vw <= 1 || vh <= 1) return;
+        var nx = (int)Math.Round((double)(x - vx) * 65535 / (vw - 1));
+        var ny = (int)Math.Round((double)(y - vy) * 65535 / (vh - 1));
+        var input = new Native.INPUT
+        {
+            type = Native.INPUT_MOUSE,
+            U = new() { mi = new() { dx = nx, dy = ny, dwFlags = Native.MOUSEEVENTF_MOVE | Native.MOUSEEVENTF_ABSOLUTE | Native.MOUSEEVENTF_VIRTUALDESK } },
+        };
+        Native.SendInput(1, new[] { input }, System.Runtime.InteropServices.Marshal.SizeOf<Native.INPUT>());
     }
 
     public static void Scroll(int dx, int dy)
