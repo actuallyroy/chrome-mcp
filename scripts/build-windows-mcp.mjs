@@ -75,10 +75,44 @@ if (existsSync(helperSrc)) {
   console.log(`vendor/windows-mcp-helper.exe copied (${(helperBytes.length / 1024 / 1024).toFixed(1)} MB)`);
 } else {
   console.warn(
-    `WARN: ${helperSrc} not found. Helper won't be in the published bundle.\n` +
-    `      Build it on a Windows host first:\n` +
-    `        cd windows-mcp && powershell scripts/build-helper.ps1`,
+    `WARN: ${helperSrc} not found locally (expected on a Linux/Vercel build).\n` +
+    `      Falling back to windows-mcp/helper-release.json if present.`,
   );
+}
+
+// 3a. Resolve the manifest's helper block. Priority:
+//   (a) local exe present -> hash it, serve from /windows/vendor (local/Windows builds).
+//   (b) no local exe but windows-mcp/helper-release.json committed -> use its external
+//       (GitHub Releases) URL + pre-computed sha. THIS is the Vercel path, since the
+//       exe is gitignored and absent on the Linux build host.
+//   (c) neither -> null (loader errors with a clear "no helper info" message).
+let helperManifest = null;
+if (helperBytes) {
+  helperManifest = {
+    arch: "x64",
+    url: "/windows/vendor/windows-mcp-helper.exe",
+    sha256: createHash("sha256").update(helperBytes).digest("hex"),
+    size_bytes: helperBytes.length,
+    requires_runtime: "Microsoft.WindowsDesktop.App 8.0+",
+  };
+} else {
+  const sidecarPath = join(MCP_DIR, "helper-release.json");
+  if (existsSync(sidecarPath)) {
+    try {
+      const sc = JSON.parse(readFileSync(sidecarPath, "utf8"));
+      if (!sc.url || !sc.sha256) throw new Error("missing url or sha256");
+      helperManifest = {
+        arch: sc.arch || "x64",
+        url: sc.url,
+        sha256: sc.sha256,
+        size_bytes: sc.size_bytes ?? null,
+        requires_runtime: sc.requires_runtime || "Microsoft.WindowsDesktop.App 8.0+",
+      };
+      console.log(`helper: using committed helper-release.json -> ${sc.url}`);
+    } catch (e) {
+      console.warn(`WARN: helper-release.json present but unusable (${e.message}). Manifest helper = null.`);
+    }
+  }
 }
 
 // 3b. Sandbox payload (vendor-sandbox/, self-contained ~190 MB across many
@@ -141,15 +175,7 @@ const manifest = {
   sha256: bundleSha,
   size_bytes: bundleBytes.length,
   released_at: new Date().toISOString(),
-  helper: helperBytes
-    ? {
-        arch: "x64",
-        url: "/windows/vendor/windows-mcp-helper.exe",
-        sha256: createHash("sha256").update(helperBytes).digest("hex"),
-        size_bytes: helperBytes.length,
-        requires_runtime: "Microsoft.WindowsDesktop.App 8.0+",
-      }
-    : null,
+  helper: helperManifest,
   sandbox_bundle: sandboxBundle,
 };
 writeFileSync(join(BUNDLE_DIR, "manifest.json"), JSON.stringify(manifest, null, 2));
@@ -170,7 +196,7 @@ const minResult = await esbuild({
 const bootstrapMin = minResult.outputFiles[0].text.trim().replace(/\n+$/, "");
 writeFileSync(join(OUT_DIR, "bootstrap.min.js"), bootstrapMin, "utf8");
 
-console.log(`windows-mcp v${version}: bundle ${(bundleBytes.length / 1024).toFixed(0)} KB, helper ${helperBytes ? (helperBytes.length / 1024 / 1024).toFixed(1) + " MB" : "missing"}, sandbox ${sandboxBundle ? (sandboxBundle.size_bytes / 1024 / 1024).toFixed(1) + " MB zip" : "missing"}, bootstrap ${bootstrapMin.length} chars`);
+console.log(`windows-mcp v${version}: bundle ${(bundleBytes.length / 1024).toFixed(0)} KB, helper ${helperManifest ? (helperManifest.size_bytes ? (helperManifest.size_bytes / 1024 / 1024).toFixed(1) + " MB " : "") + (helperBytes ? "local" : "external") : "MISSING"}, sandbox ${sandboxBundle ? (sandboxBundle.size_bytes / 1024 / 1024).toFixed(1) + " MB zip" : "missing"}, bootstrap ${bootstrapMin.length} chars`);
 console.log("build-windows-mcp: done.");
 
 function countFiles(dir) {

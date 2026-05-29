@@ -1,0 +1,7 @@
+{
+  "arch": "x64",
+  "url": "https://github.com/actuallyroy/chrome-mcp/releases/download/windows-mcp-helper-v0.1.0/windows-mcp-helper.exe",
+  "sha256": "1ecbce6ef82879642446173522dd208718f572f3eeff68519173a30acf685e6c",
+  "size_bytes": 26250934,
+  "requires_runtime": "Microsoft.WindowsDesktop.App 8.0+"
+}
