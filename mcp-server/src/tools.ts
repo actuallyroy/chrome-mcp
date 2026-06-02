@@ -347,33 +347,40 @@ export const tools: Tool[] = [
   {
     name: "get_network",
     description:
-      "Return captured network requests (fetch + XHR) with url, method, status, duration. Set clear=true to empty the buffer. Use url_contains to filter.",
+      "Return captured network requests (fetch + XHR) with url, method, status, duration. status=0 with opaque=true means a cross-origin response was blocked by CORS (request likely still succeeded). Set clear=true to empty the buffer. Use url_contains to filter. Set include_body=true to also return (truncated) request and response bodies — useful for reverse-engineering an app's API payloads.",
     schema: z.object({
       clear: z.boolean().default(false),
       url_contains: z.string().optional(),
       limit: z.number().int().min(1).max(500).default(50),
+      include_body: z.boolean().default(false),
     }),
     handler: async (args) =>
       withPage(async (p) => {
-        const { clear, url_contains, limit } = args as {
+        const { clear, url_contains, limit, include_body } = args as {
           clear: boolean;
           url_contains?: string;
           limit: number;
+          include_body: boolean;
         };
         const entries = await p.evaluate(
-          (shouldClear: boolean, filter: string | undefined, lim: number) => {
+          (shouldClear: boolean, filter: string | undefined, lim: number, withBody: boolean) => {
             const w = window as unknown as {
-              __mcp: { network: { url: string; method: string; status: number | null; ms: number | null; kind: string }[] };
+              __mcp: { network: { url: string; method: string; status: number | null; ms: number | null; kind: string; opaque?: boolean; req_body?: string | null; resp_body?: string | null }[] };
             };
             let list = [...w.__mcp.network];
             if (filter) list = list.filter((e) => e.url.includes(filter));
             list = list.slice(-lim);
             if (shouldClear) w.__mcp.network.length = 0;
+            if (!withBody) {
+              // Drop body fields by default to keep payloads small.
+              return list.map(({ req_body, resp_body, ...rest }) => rest);
+            }
             return list;
           },
           clear,
           url_contains,
           limit,
+          include_body,
         );
         return json(entries);
       }),
