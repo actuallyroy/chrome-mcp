@@ -32,6 +32,10 @@ public/windows/vendor/*
 public/windows/loader.mjs
 public/windows/bootstrap.min.js
 public/bootstrap.min.js
+public/orch/
+orch-mcp/dist/
+orch-mcp/node_modules/
+orch-mcp/package-lock.json
 android-mcp/dist/
 android-mcp/package-lock.json
 macos-mcp/dist/

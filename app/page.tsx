@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import InstallBlock from "./InstallBlock";
-import OrchInstallBlock from "./OrchInstallBlock";
 
 type Manifest = {
   version: string;
@@ -34,6 +33,8 @@ export default function Page() {
   const androidBootstrap = read("android/bootstrap.min.js")?.trim() ?? "";
   const macosBootstrap = read("macos/bootstrap.min.js")?.trim() ?? "";
   const windowsBootstrap = read("windows/bootstrap.min.js")?.trim() ?? "";
+  const orchManifest = readManifest("orch/bundle/manifest.json");
+  const orchBootstrap = read("orch/bootstrap.min.js")?.trim() ?? "";
 
   return (
     <main>
@@ -171,7 +172,8 @@ export default function Page() {
 
       <section>
         <h2>
-          orch-mcp <span className="meta">v0.2.0</span>
+          orch-mcp{" "}
+          {orchManifest && <span className="meta">v{orchManifest.version}</span>}
           <span className="meta"> · master-of-sessions</span>
         </h2>
         <p>
@@ -187,10 +189,17 @@ export default function Page() {
           in foreground (block-and-return) or background (fire, poll <code>worker_result</code>
           later). Fan out two workers in parallel and rejoin when both finish.
         </p>
-        <h3>Build, then paste into <code>~/.claude.json</code>:</h3>
-        <pre><code>{`git clone https://github.com/actuallyroy/chrome-mcp
-cd chrome-mcp/orch-mcp && npm install && npm run build`}</code></pre>
-        <OrchInstallBlock />
+        <h3>Paste into <code>~/.claude.json</code> and restart Claude Code:</h3>
+        <InstallBlock bootstrap={orchBootstrap} product="orch" />
+        {orchManifest && (
+          <p className="hash">
+            sha256: {orchManifest.sha256}
+            <br />
+            <a href={`/orch/bundle/v${orchManifest.version}.mjs`}>bundle</a> ·{" "}
+            <a href="/orch/bundle/manifest.json">manifest</a> ·{" "}
+            <a href="/orch/loader.mjs">loader.mjs</a>
+          </p>
+        )}
         <p className="hash">
           Requires the <code>claude</code> CLI on <code>$PATH</code>. Override with{" "}
           <code>ORCH_MCP_CLAUDE_BIN</code>.
