@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import InstallBlock from "./InstallBlock";
+import OrchInstallBlock from "./OrchInstallBlock";
 
 type Manifest = {
   version: string;
@@ -36,11 +37,12 @@ export default function Page() {
 
   return (
     <main>
-      <h1>Drive real Chrome, Android, macOS, and Windows from Claude Code</h1>
+      <h1>Drive real Chrome, Android, macOS, Windows — and other Claude sessions — from Claude Code</h1>
       <p className="tagline">
-        MCP servers that let an agent tap, type, and reason through your actual apps — the
-        browser you're logged into, the device in your hand, and the desktop in front of you. No
-        headless sandbox, no fragile selectors, no install script.
+        Five MCP servers. Four of them let an agent tap, type, and reason through your actual apps —
+        the browser you're logged into, the device in your hand, the desktop in front of you. The
+        fifth lets one Claude session drive others. No headless sandbox, no fragile selectors, no
+        install script.
       </p>
 
       <section>
@@ -167,6 +169,34 @@ export default function Page() {
         )}
       </section>
 
+      <section>
+        <h2>
+          orch-mcp <span className="meta">v0.2.0</span>
+          <span className="meta"> · master-of-sessions</span>
+        </h2>
+        <p>
+          A different beast. Instead of driving an app, it lets one Claude Code session drive others —
+          a <em>master</em> session that can adopt or spin up <em>worker</em> sessions, send them
+          prompts, fork its own context into a new worker, and run them in background while you keep
+          working. Each worker is a real persistent Claude session on disk; the master just shells out
+          to <code>claude --resume</code> under the hood.
+        </p>
+        <p>
+          Workers are launched with <code>Bash</code> denied — they can analyze, plan, read files, and
+          edit, but all shell execution stays in the master so you see it in one terminal. Send tasks
+          in foreground (block-and-return) or background (fire, poll <code>worker_result</code>
+          later). Fan out two workers in parallel and rejoin when both finish.
+        </p>
+        <h3>Build, then paste into <code>~/.claude.json</code>:</h3>
+        <pre><code>{`git clone https://github.com/actuallyroy/chrome-mcp
+cd chrome-mcp/orch-mcp && npm install && npm run build`}</code></pre>
+        <OrchInstallBlock />
+        <p className="hash">
+          Requires the <code>claude</code> CLI on <code>$PATH</code>. Override with{" "}
+          <code>ORCH_MCP_CLAUDE_BIN</code>.
+        </p>
+      </section>
+
       <h2>Why not Playwright / Maestro / Appium?</h2>
       <p>
         Those are great for CI suites that run on clean sandboxes. They're frustrating for{" "}
@@ -275,6 +305,41 @@ export default function Page() {
         </li>
       </ul>
 
+      <h2>What's in orch-mcp</h2>
+      <ul>
+        <li>
+          <code>worker_list</code> / <code>worker_list_available</code> — registered workers, plus
+          any unregistered Claude sessions in this project (with recent prompt + assistant snippets so
+          you can pick the right one to adopt)
+        </li>
+        <li>
+          <code>worker_register</code> — adopt an existing session by id under a friendly name
+        </li>
+        <li>
+          <code>worker_create</code> — spin up a fresh worker with an initial briefing prompt
+        </li>
+        <li>
+          <code>worker_fork</code> — snapshot the master's transcript into a new session id so the
+          fork starts with full context and diverges. Optional source override via{" "}
+          <code>from_session_id</code>.
+        </li>
+        <li>
+          <code>worker_send {"{ background: true }"}</code> — fire-and-poll: master keeps working,
+          retrieve the answer later with <code>worker_result</code>
+        </li>
+        <li>
+          <code>worker_result</code> / <code>worker_tasks</code> / <code>worker_cancel</code> — poll,
+          inspect, kill background tasks
+        </li>
+        <li>
+          <code>worker_compact</code> — run <code>/compact</code> against a worker that's gotten long
+        </li>
+        <li>
+          <code>worker_status</code> / <code>worker_remove</code> — inspect transcript size, last
+          activity; unregister mappings (the underlying session file is preserved on disk)
+        </li>
+      </ul>
+
       <h2>Honest caveats</h2>
       <ul>
         <li>
@@ -293,6 +358,16 @@ export default function Page() {
         <li>
           <strong>The bundle is auto-downloaded.</strong> SHA-256 verified, cached locally. If
           you're uncomfortable with that, pin a version and review the bundle yourself.
+        </li>
+        <li>
+          <strong>orch-mcp workers can't run Bash by design.</strong> If a worker concludes it needs
+          shell, it says so and the master has to run the command itself. Keeps all shell visible in
+          one terminal.
+        </li>
+        <li>
+          <strong>worker_fork is a transcript-file snapshot.</strong> If the source session writes
+          mid-fork, the new session's last line can be truncated — Claude tolerates this on resume
+          but it's worth knowing.
         </li>
       </ul>
     </main>
