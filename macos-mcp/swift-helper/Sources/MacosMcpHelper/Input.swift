@@ -1,11 +1,31 @@
 // Mouse + keyboard event posting via CGEvent. Not deprecated on Apple
 // Silicon; requires Accessibility TCC grant for our binary.
+//
+// Every method takes an optional `targetPid`. When non-nil, events are
+// delivered via `CGEvent.postToPid(_:)` — the target app receives them as if
+// it were frontmost, but the user's actual frontmost app is NOT demoted and
+// the on-screen cursor doesn't move. That's the foundation for running the
+// agent without disturbing whatever the user is doing.
+//
+// When `targetPid` is nil, events go through `.cghidEventTap` (the system HID
+// tap) and behave like real human input — moves the cursor, goes to the
+// frontmost app. Use that path only when we don't know which app should
+// receive the event (raw {x,y} clicks with no active-app context).
 
 import CoreGraphics
 import ApplicationServices
 
 enum Input {
-    static func click(at point: CGPoint, button: CGMouseButton = .left, count: Int = 1) {
+    private static func deliver(_ evt: CGEvent?, to pid: pid_t?) {
+        guard let evt = evt else { return }
+        if let pid = pid {
+            evt.postToPid(pid)
+        } else {
+            evt.post(tap: .cghidEventTap)
+        }
+    }
+
+    static func click(at point: CGPoint, button: CGMouseButton = .left, count: Int = 1, targetPid: pid_t? = nil) {
         let down = CGEvent(mouseEventSource: nil, mouseType: button == .right ? .rightMouseDown : .leftMouseDown,
                            mouseCursorPosition: point, mouseButton: button)
         let up = CGEvent(mouseEventSource: nil, mouseType: button == .right ? .rightMouseUp : .leftMouseUp,
@@ -13,34 +33,35 @@ enum Input {
         for i in 1...count {
             down?.setIntegerValueField(.mouseEventClickState, value: Int64(i))
             up?.setIntegerValueField(.mouseEventClickState, value: Int64(i))
-            down?.post(tap: .cghidEventTap)
-            up?.post(tap: .cghidEventTap)
+            deliver(down, to: targetPid)
+            deliver(up, to: targetPid)
         }
     }
 
     // Click by asking the AX element to perform its press action — preferred
     // when available because it goes through the app's own action handlers
-    // (works for hidden / off-screen / out-of-window-z-order elements).
+    // (works for hidden / off-screen / out-of-window-z-order elements). AX
+    // actions are inherently focus-free.
     @discardableResult
     static func axPress(_ el: AXUIElement) -> Bool {
         return AXUIElementPerformAction(el, kAXPressAction as CFString) == .success
     }
 
     // Move the mouse without clicking (hover).
-    static func moveMouse(to point: CGPoint) {
-        CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?
-            .post(tap: .cghidEventTap)
+    static func moveMouse(to point: CGPoint, targetPid: pid_t? = nil) {
+        let evt = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)
+        deliver(evt, to: targetPid)
     }
 
     // Scroll wheel. dx/dy are in line units (negative dy = scroll down content).
-    static func scroll(dx: Int32, dy: Int32) {
-        guard let evt = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
-                                wheel1: dy, wheel2: dx, wheel3: 0) else { return }
-        evt.post(tap: .cghidEventTap)
+    static func scroll(dx: Int32, dy: Int32, targetPid: pid_t? = nil) {
+        let evt = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
+                          wheel1: dy, wheel2: dx, wheel3: 0)
+        deliver(evt, to: targetPid)
     }
 
     // Type a string by synthesizing key events.
-    static func typeString(_ s: String) {
+    static func typeString(_ s: String, targetPid: pid_t? = nil) {
         let src = CGEventSource(stateID: .hidSystemState)
         for scalar in s.unicodeScalars {
             var ch = UniChar(scalar.value & 0xFFFF)
@@ -48,8 +69,8 @@ enum Input {
                   let up = CGEvent(keyboardEventSource: src, virtualKey: 0, keyDown: false) else { continue }
             down.keyboardSetUnicodeString(stringLength: 1, unicodeString: &ch)
             up.keyboardSetUnicodeString(stringLength: 1, unicodeString: &ch)
-            down.post(tap: .cghidEventTap)
-            up.post(tap: .cghidEventTap)
+            deliver(down, to: targetPid)
+            deliver(up, to: targetPid)
         }
     }
 
@@ -95,7 +116,7 @@ enum Input {
     ]
 
     @discardableResult
-    static func pressKey(_ name: String, modifiers: [String] = []) -> Bool {
+    static func pressKey(_ name: String, modifiers: [String] = [], targetPid: pid_t? = nil) -> Bool {
         let upper = name.uppercased()
         guard let code = KEYCODES[upper] else { return false }
         let src = CGEventSource(stateID: .hidSystemState)
@@ -107,8 +128,8 @@ enum Input {
               let up = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: false) else { return false }
         down.flags = flags
         up.flags = flags
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
+        deliver(down, to: targetPid)
+        deliver(up, to: targetPid)
         return true
     }
 

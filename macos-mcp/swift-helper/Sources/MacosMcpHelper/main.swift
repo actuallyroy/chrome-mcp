@@ -105,6 +105,21 @@ func numI(_ v: Any?) -> Int? {
     return nil
 }
 
+// Resolve which app should receive synthesized input events.
+//   1. Explicit `pid` arg (Node injects activePid here).
+//   2. Element-derived pid via AXUIElementGetPid (for ref-based calls).
+//   3. nil → fall back to system HID tap (event goes to actual frontmost).
+// Returning a non-nil pid routes through CGEvent.postToPid — the target app
+// receives the event without becoming frontmost and without moving the cursor.
+func targetPid(from params: [String: Any], element: AXUIElement? = nil) -> pid_t? {
+    if let p = numI(params["pid"]) { return pid_t(p) }
+    if let el = element {
+        var pid: pid_t = 0
+        if AXUIElementGetPid(el, &pid) == .success, pid > 0 { return pid }
+    }
+    return nil
+}
+
 // MARK: - Dispatch
 
 func dispatch(_ req: Request) async -> Response {
@@ -139,10 +154,14 @@ func dispatch(_ req: Request) async -> Response {
             ) else {
                 return Response(id: req.id, error: .init(message: "app not found"))
             }
-            let ok = Apps.activate(app)
+            // bring_to_front=false → focus-free mode: target the app for input
+            // routing without raising it. User's frontmost window stays put.
+            let bringToFront = (p["bring_to_front"] as? Bool) ?? true
+            let ok = Apps.activate(app, bringToFront: bringToFront)
             return Response(id: req.id, result: AnyEncodable([
                 "ok": ok, "pid": Int(app.processIdentifier),
                 "name": app.localizedName ?? "",
+                "bring_to_front": bringToFront,
             ] as [String: Any]))
 
         case "launch_app":
@@ -182,8 +201,9 @@ func dispatch(_ req: Request) async -> Response {
                     return Response(id: req.id, error: .init(message: "no element with ref=\(ref) — call outline again"))
                 }
                 // Prefer the AX press action — works for off-screen / collapsed
-                // elements. Fall back to a synthesized mouse click at the
-                // element's centre.
+                // elements AND is inherently focus-free. Fall back to a
+                // synthesized mouse click at the element's centre, routed to
+                // the owning app's pid so the user's frontmost stays put.
                 if Input.axPress(el) {
                     return Response(id: req.id, result: AnyEncodable(["ok": true, "via": "ax_press"]))
                 }
@@ -192,15 +212,17 @@ func dispatch(_ req: Request) async -> Response {
                 }
                 let point = CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2)
                 let count = (p["count"] as? Int) ?? 1
-                Input.click(at: point, count: count)
-                return Response(id: req.id, result: AnyEncodable(["ok": true, "via": "cgevent", "x": point.x, "y": point.y] as [String: Any]))
+                let pid = targetPid(from: p, element: el)
+                Input.click(at: point, count: count, targetPid: pid)
+                return Response(id: req.id, result: AnyEncodable(["ok": true, "via": "cgevent", "x": point.x, "y": point.y, "focus_free": pid != nil] as [String: Any]))
             }
             if let x = numD(p["x"]), let y = numD(p["y"]) {
                 let count = (p["count"] as? Int) ?? 1
                 let buttonStr = (p["button"] as? String) ?? "left"
                 let btn: CGMouseButton = buttonStr == "right" ? .right : .left
-                Input.click(at: CGPoint(x: x, y: y), button: btn, count: count)
-                return Response(id: req.id, result: AnyEncodable(["ok": true, "via": "cgevent"]))
+                let pid = targetPid(from: p)
+                Input.click(at: CGPoint(x: x, y: y), button: btn, count: count, targetPid: pid)
+                return Response(id: req.id, result: AnyEncodable(["ok": true, "via": "cgevent", "focus_free": pid != nil] as [String: Any]))
             }
             return Response(id: req.id, error: .init(message: "click: pass ref OR (x,y)"))
 
@@ -215,32 +237,34 @@ func dispatch(_ req: Request) async -> Response {
             if Input.axSetValue(el, value) {
                 return Response(id: req.id, result: AnyEncodable(["ok": true, "via": "ax_set_value"]))
             }
-            // Fallback: focus + click + type. Useful for custom-drawn inputs
-            // that reject AXSetValue.
+            // Fallback: focus + click + type, routed to the owning app's pid.
+            let pid = targetPid(from: p, element: el)
             if let pos = Ax.attrPosition(el), let size = Ax.attrSize(el) {
-                Input.click(at: CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2))
+                Input.click(at: CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2), targetPid: pid)
             }
             // Tiny delay so the click registers before we start typing.
             try? await Task.sleep(nanoseconds: 50_000_000)
-            Input.typeString(value)
-            return Response(id: req.id, result: AnyEncodable(["ok": true, "via": "type"]))
+            Input.typeString(value, targetPid: pid)
+            return Response(id: req.id, result: AnyEncodable(["ok": true, "via": "type", "focus_free": pid != nil] as [String: Any]))
 
         case "press_key":
             guard let key = p["key"] as? String else {
                 return Response(id: req.id, error: .init(message: "press_key: key required"))
             }
             let mods = (p["modifiers"] as? [Any])?.compactMap { $0 as? String } ?? []
-            if !Input.pressKey(key, modifiers: mods) {
+            let pid = targetPid(from: p)
+            if !Input.pressKey(key, modifiers: mods, targetPid: pid) {
                 return Response(id: req.id, error: .init(message: "press_key: unknown key '\(key)'. Known: \(Input.KEYCODES.keys.sorted().joined(separator: ", "))"))
             }
-            return Response(id: req.id, result: AnyEncodable(["ok": true]))
+            return Response(id: req.id, result: AnyEncodable(["ok": true, "focus_free": pid != nil] as [String: Any]))
 
         case "type_text":
             guard let value = p["text"] as? String else {
                 return Response(id: req.id, error: .init(message: "type_text: text required"))
             }
-            Input.typeString(value)
-            return Response(id: req.id, result: AnyEncodable(["ok": true]))
+            let pid = targetPid(from: p)
+            Input.typeString(value, targetPid: pid)
+            return Response(id: req.id, result: AnyEncodable(["ok": true, "focus_free": pid != nil] as [String: Any]))
 
         case "hover":
             if let ref = p["ref"] as? Int {
@@ -250,12 +274,14 @@ func dispatch(_ req: Request) async -> Response {
                 guard let pos = Ax.attrPosition(el), let size = Ax.attrSize(el) else {
                     return Response(id: req.id, error: .init(message: "element has no AXPosition/AXSize"))
                 }
-                Input.moveMouse(to: CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2))
-                return Response(id: req.id, result: AnyEncodable(["ok": true]))
+                let pid = targetPid(from: p, element: el)
+                Input.moveMouse(to: CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2), targetPid: pid)
+                return Response(id: req.id, result: AnyEncodable(["ok": true, "focus_free": pid != nil] as [String: Any]))
             }
             if let x = numD(p["x"]), let y = numD(p["y"]) {
-                Input.moveMouse(to: CGPoint(x: x, y: y))
-                return Response(id: req.id, result: AnyEncodable(["ok": true]))
+                let pid = targetPid(from: p)
+                Input.moveMouse(to: CGPoint(x: x, y: y), targetPid: pid)
+                return Response(id: req.id, result: AnyEncodable(["ok": true, "focus_free": pid != nil] as [String: Any]))
             }
             return Response(id: req.id, error: .init(message: "hover: pass ref OR (x,y)"))
 
@@ -264,13 +290,17 @@ func dispatch(_ req: Request) async -> Response {
             let dy = Int32(numI(p["dy"]) ?? -200)  // default scroll down
             // If a ref is given, move the cursor over it first so the scroll
             // lands on the right scrollable region.
+            var refEl: AXUIElement? = nil
             if let ref = p["ref"] as? Int, let el = await AxRefStore.shared.resolve(ref),
                let pos = Ax.attrPosition(el), let size = Ax.attrSize(el) {
-                Input.moveMouse(to: CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2))
+                refEl = el
+                let pid = targetPid(from: p, element: el)
+                Input.moveMouse(to: CGPoint(x: pos.x + size.width / 2, y: pos.y + size.height / 2), targetPid: pid)
                 try? await Task.sleep(nanoseconds: 30_000_000)
             }
-            Input.scroll(dx: dx, dy: dy)
-            return Response(id: req.id, result: AnyEncodable(["ok": true, "dx": Int(dx), "dy": Int(dy)] as [String: Any]))
+            let pid = targetPid(from: p, element: refEl)
+            Input.scroll(dx: dx, dy: dy, targetPid: pid)
+            return Response(id: req.id, result: AnyEncodable(["ok": true, "dx": Int(dx), "dy": Int(dy), "focus_free": pid != nil] as [String: Any]))
 
         case "describe":
             guard let ref = p["ref"] as? Int else {
@@ -354,7 +384,7 @@ func dispatch(_ req: Request) async -> Response {
                 let hit = matches[occ]
                 let cx = hit.x + hit.width / 2
                 let cy = hit.y + hit.height / 2
-                Input.click(at: CGPoint(x: cx, y: cy))
+                Input.click(at: CGPoint(x: cx, y: cy), targetPid: pid)
                 return Response(id: req.id, result: AnyEncodable([
                     "ok": true,
                     "matched": hit.text,

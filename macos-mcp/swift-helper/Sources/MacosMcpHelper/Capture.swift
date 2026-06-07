@@ -155,8 +155,11 @@ enum Capture {
         return (full, .zero, CGSize(width: display.width, height: display.height))
     }
 
+    // Always refresh: window frames change constantly (move, resize, focus).
+    // The display-list cache stays — that's the heavy bit. Window list is
+    // cheaper to re-query and worth the freshness for cropping accuracy.
     private static func firstFrontWindow(pid: Int32) async throws -> SCWindow? {
-        let content = try await freshContent()
+        let content = try await freshContent(forceRefresh: true)
         return content.windows.first { $0.owningApplication?.processID == pid && $0.frame.width > 100 }
     }
 

@@ -23,7 +23,7 @@ import {
 } from "./tasks.js";
 import { fileFeedback } from "./feedback.js";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.2.1";
 
 // Tiny ring buffer of the last ~20 tool invocations so send_feedback can
 // attach recent activity as context. Mirrors what chrome/android-mcp do via

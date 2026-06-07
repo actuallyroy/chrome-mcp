@@ -113,6 +113,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     return { content: [{ type: "text", text: `Unknown tool: ${req.params.name}` }], isError: true };
   }
   const rawArgs = req.params.arguments ?? {};
+  const __t0 = Date.now();
   // Interactive tools that may trigger new dev overlays after executing — also
   // auto-dismiss afterwards so the next outline/call sees a clean tree.
   const INTERACTIVE_TOOLS = new Set<string>([
@@ -191,12 +192,22 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         batchNudgeShown = true;
       }
     }
+    {
+      const ms = Date.now() - __t0;
+      const note = `\n[took ${ms}ms]`;
+      const firstText = result.content.find((c) => c.type === "text");
+      if (firstText && typeof firstText.text === "string") {
+        firstText.text = firstText.text + note;
+      } else {
+        result.content.push({ type: "text", text: note.trimStart() });
+      }
+    }
     return result;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     recordCall(tool.name, rawArgs, false, message);
     return {
-      content: [{ type: "text", text: maybeAppendFeedbackHint(tool.name, message) }],
+      content: [{ type: "text", text: `${maybeAppendFeedbackHint(tool.name, message)}\n[took ${Date.now() - __t0}ms]` }],
       isError: true,
     };
   }

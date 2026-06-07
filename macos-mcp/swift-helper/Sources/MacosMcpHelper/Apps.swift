@@ -42,7 +42,16 @@ enum Apps {
     // user didn't just click — our helper has no foreground status, so this
     // always-no-ops. The reliable fallback is AppleScript via NSAppleScript,
     // which routes through Apple Events daemon and isn't subject to the rule.
-    static func activate(_ app: NSRunningApplication) -> Bool {
+    //
+    // Set `bringToFront = false` for focus-free mode: the app is *selected* as
+    // the agent's target (the caller still uses its pid for input routing via
+    // CGEvent.postToPid) but is NOT raised — the user's actual frontmost app
+    // stays where it is. The boolean returned is whether the app is now
+    // frontmost; in focus-free mode this is naturally usually false.
+    static func activate(_ app: NSRunningApplication, bringToFront: Bool = true) -> Bool {
+        if !bringToFront {
+            return NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier
+        }
         // First try the modern API (works on the rare path where we ARE the
         // frontmost app — e.g. user just allowed accessibility prompt).
         _ = app.activate(options: [.activateAllWindows])

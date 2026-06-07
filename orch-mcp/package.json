@@ -1,6 +1,6 @@
 {
   "name": "orch-mcp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "MCP server that lets a master Claude Code session drive other (worker) Claude sessions in the same project — resume by name, send prompts, compact, all via the `claude` CLI under the hood.",
   "type": "module",
   "bin": {

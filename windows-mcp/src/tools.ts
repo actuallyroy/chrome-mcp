@@ -44,7 +44,7 @@ export function setNotifyToolsChanged(fn: () => void) { notifyToolsChanged = fn;
 function emitToolsChanged() { if (notifyToolsChanged) notifyToolsChanged(); }
 
 const FLOW_CAP = 20;
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.1";
 
 const DEFAULT_RESUME_FILE = joinPath(tmpdir(), "windows-mcp.resume");
 

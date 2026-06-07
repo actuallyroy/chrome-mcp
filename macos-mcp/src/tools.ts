@@ -39,7 +39,7 @@ export function setNotifyToolsChanged(fn: () => void) { notifyToolsChanged = fn;
 function emitToolsChanged() { if (notifyToolsChanged) notifyToolsChanged(); }
 
 const FLOW_CAP = 20;
-export const VERSION = "0.2.7";
+export const VERSION = "0.2.12";
 
 // ---- AX outline renderer ----------------------------------------------------
 
@@ -58,6 +58,58 @@ type AxNode = {
 };
 
 const NOISY_ROLES = new Set(["AXUnknown", "AXLayoutItem"]);
+
+// "Does the OS see anything inside this app's window besides chrome?"
+// Explicit signal for AX-empty windows (SCE/Zed/GPUI, egui, Metal-rendered
+// apps): the AXWindow has only its standard NSWindow children (close /
+// minimize / zoom buttons, title static text, optionally toolbar shell) and
+// no descendants with any text content (title/label/value) — meaning the
+// window body is entirely unrepresented in AX. That's the unambiguous
+// "OCR is the only way to see this app" signature.
+//
+// A normal native app with even one labeled control would have at least one
+// descendant carrying text, so this won't false-trigger on small dialogs.
+function findFirstWindow(root: AxNode): AxNode | null {
+  if (root.role === "AXWindow") return root;
+  for (const c of root.children) {
+    const hit = findFirstWindow(c);
+    if (hit) return hit;
+  }
+  return null;
+}
+
+function hasAnyTextDescendant(n: AxNode): boolean {
+  if ((n.title || n.label || n.value)?.toString().trim()) return true;
+  for (const c of n.children) if (hasAnyTextDescendant(c)) return true;
+  return false;
+}
+
+// Standard NSWindow chrome elements that exist on every native window even
+// when the body is empty. Detected positionally: direct AXButton children
+// of the window (close/min/zoom/full-screen sit in the title bar) and the
+// single AXStaticText whose value matches the window title.
+function isWindowChrome(child: AxNode, windowTitle: string | null | undefined): boolean {
+  if (child.role === "AXButton" && child.children.length <= 1) return true;
+  if (child.role === "AXStaticText") {
+    const t = (child.value || child.title || "").trim();
+    if (t === (windowTitle || "").trim()) return true;
+  }
+  return false;
+}
+
+// Returns true if the AX tree exposes meaningful content inside the
+// frontmost window. Returns false when the window contains only chrome —
+// the explicit "we need OCR" signal.
+function windowHasContent(root: AxNode): boolean {
+  const win = findFirstWindow(root);
+  if (!win) return true; // No window in the tree — defer to caller; don't auto-OCR.
+  const title = win.title;
+  for (const c of win.children) {
+    if (isWindowChrome(c, title)) continue;
+    if (hasAnyTextDescendant(c)) return true;
+  }
+  return false;
+}
 
 function nodeIsInteresting(n: AxNode): boolean {
   if (NOISY_ROLES.has(n.role)) return false;
@@ -93,6 +145,15 @@ let activePid: number | null = null;
 function requireActivePid(): number {
   if (activePid == null) throw new Error("No active app. Call focus_app (by name or pid) or launch_app first.");
   return activePid;
+}
+
+// Inject the active pid into input-tool args so the Swift helper can route
+// CGEvents via postToPid (focus-free) instead of the system HID tap (which
+// goes to whatever app is actually frontmost). Caller-supplied pid wins.
+function withTargetPid<T extends Record<string, unknown>>(args: T): T {
+  if (args.pid != null) return args;
+  if (activePid == null) return args;
+  return { ...args, pid: activePid };
 }
 
 // Hash an AxNode for wait_for_stable structural comparison.
@@ -259,16 +320,22 @@ export const tools: Tool[] = [
   },
   {
     name: "focus_app",
-    description: "Make an already-running app the active one. Provide pid, bundle_id, or name.",
+    description:
+      "Make an app the agent's input target. Provide pid, bundle_id, or name. " +
+      "Default `bring_to_front: true` raises the app like a real Cmd+Tab — visible to the user. " +
+      "Set `bring_to_front: false` for focus-free mode: subsequent click/type/press_key calls are routed to this app via CGEvent.postToPid without raising it or moving the cursor, so the user's actual frontmost window stays put. " +
+      "Focus-free mode is right for background automation; visible mode is right when you actually want the user to see what's happening.",
     schema: z.object({
       pid: z.number().int().optional(),
       bundle_id: z.string().optional(),
       name: z.string().optional(),
+      bring_to_front: z.boolean().default(true),
     }),
     handler: async (args) => {
-      const r = await callHelper<{ ok: boolean; pid: number; name: string }>("focus_app", args);
+      const r = await callHelper<{ ok: boolean; pid: number; name: string; bring_to_front: boolean }>("focus_app", args);
       activePid = r.pid;
-      return text(`active app: ${r.name} (pid=${r.pid})`);
+      const mode = r.bring_to_front ? "frontmost" : "focus-free";
+      return text(`active app: ${r.name} (pid=${r.pid}, ${mode})`);
     },
   },
   {
@@ -287,19 +354,57 @@ export const tools: Tool[] = [
     name: "outline",
     description:
       "Compact text outline of the active app's AX tree with stable refs. Refs reset each call (NOT stable across calls). " +
-      "For Electron apps (Slack, Discord, VS Code, Notion, Figma desktop) the helper auto-pokes AXManualAccessibility so the tree wakes up.",
+      "For Electron apps (Slack, Discord, VS Code, Notion, Figma desktop) the helper auto-pokes AXManualAccessibility so the tree wakes up. " +
+      "For AX-empty apps (Zed/GPUI editors, egui apps, Logic Pro, Final Cut, Adobe canvases, games): when the OS reports the window body as empty — i.e. the AXWindow has only standard NSWindow chrome (close/min/zoom buttons + title) and no descendants with any text content — this tool automatically runs Apple Vision OCR on the same window and appends the text regions with screen-point coordinates. Click them with `click { x, y }`. " +
+      "`ocr` modes: 'auto' (default; OCR kicks in only when the AX window body is empty), 'always' (include OCR regardless), 'never' (pure AX).",
     schema: z.object({
       pid: z.number().int().optional(),
       max_depth: z.number().int().min(1).max(50).default(20),
       max_nodes: z.number().int().min(50).max(10_000).default(1500),
       raw: z.boolean().default(false),
+      ocr: z.enum(["auto", "always", "never"]).default("auto").describe("'auto' = run OCR when the OS reports an empty window body. 'always' = always include OCR. 'never' = AX only."),
     }),
     handler: async (args) => {
-      const { pid, max_depth, max_nodes, raw } = args as { pid?: number; max_depth: number; max_nodes: number; raw: boolean };
+      const { pid, max_depth, max_nodes, raw, ocr } = args as {
+        pid?: number; max_depth: number; max_nodes: number; raw: boolean;
+        ocr: "auto" | "always" | "never";
+      };
       const usePid = pid ?? requireActivePid();
       const root = await callHelper<AxNode>("outline", { pid: usePid, max_depth, max_nodes });
       if (raw) return json(root);
-      return text(renderOutline(root));
+
+      const axText = renderOutline(root);
+      const bodyHasContent = windowHasContent(root);
+
+      const shouldOcr =
+        ocr === "always" ||
+        (ocr === "auto" && !bodyHasContent);
+
+      if (!shouldOcr) return text(axText);
+
+      // OCR the same app's foreground window. Best-effort.
+      try {
+        const ocrRes = await callHelper<{ hits: Array<{ text: string; x: number; y: number; width: number; height: number; confidence: number }> }>(
+          "find_text",
+          { pid: usePid, text: "" },
+        );
+        const hits = (ocrRes?.hits || []).filter((h) => h.text.trim().length > 0);
+        if (hits.length === 0) return text(axText);
+
+        const ocrLines = hits.map((h) => {
+          const cx = Math.round(h.x + h.width / 2);
+          const cy = Math.round(h.y + h.height / 2);
+          const t = h.text.replace(/\s+/g, " ").slice(0, 100);
+          return `  [ocr "${t}" at (${cx},${cy}) ${Math.round(h.width)}x${Math.round(h.height)}]`;
+        }).join("\n");
+
+        const header = ocr === "always"
+          ? `\n\n[ocr] always-on. ${hits.length} text regions:`
+          : `\n\n[ocr-fallback] AX window body is empty (only chrome). Appending ${hits.length} OCR regions — click via \`click { x, y }\`:`;
+        return text(axText + header + "\n" + ocrLines);
+      } catch (e) {
+        return text(axText + `\n\n[ocr-fallback failed: ${(e as Error).message}]`);
+      }
     },
   },
   {
@@ -328,7 +433,7 @@ export const tools: Tool[] = [
         if (!hit) throw new Error(`click: no element matches ${JSON.stringify({ text: a.text, identifier: a.identifier, role: a.role })}`);
         a.ref = hit.ref;
       }
-      const r = await callHelper("click", a as unknown as Record<string, unknown>);
+      const r = await callHelper("click", withTargetPid(a as unknown as Record<string, unknown>));
       return json(r);
     },
   },
@@ -346,41 +451,42 @@ export const tools: Tool[] = [
         if (!hit) throw new Error("fill: locator did not resolve");
         a.ref = hit.ref;
       }
-      const r = await callHelper("fill", { ref: a.ref, value: a.value });
+      const r = await callHelper("fill", withTargetPid({ ref: a.ref, value: a.value }));
       return json(r);
     },
   },
   {
     name: "type_text",
-    description: "Type a literal string via synthesized key events. No locator — types into whatever has keyboard focus.",
+    description: "Type a literal string via synthesized key events. Routed to the active app (set by focus_app) via CGEvent.postToPid, so it lands in that app's focused control without raising it.",
     schema: z.object({ text: z.string() }),
-    handler: async (args) => json(await callHelper("type_text", args)),
+    handler: async (args) => json(await callHelper("type_text", withTargetPid(args))),
   },
   {
     name: "press_key",
     description:
-      "Synthesize a keypress with optional modifiers. " +
+      "Synthesize a keypress with optional modifiers, routed to the active app (set by focus_app). " +
       "Letters A-Z, digits 0-9, RETURN/ENTER, TAB, SPACE, DELETE/BACKSPACE, FORWARD_DELETE, ESC/ESCAPE, " +
       "LEFT, RIGHT, UP, DOWN, HOME, END, PAGEUP, PAGEDOWN, F1..F12, " +
       "GRAVE, MINUS, EQUAL, LEFT_BRACKET, RIGHT_BRACKET, BACKSLASH, SEMICOLON, QUOTE, COMMA, PERIOD, SLASH, " +
       "CAPS_LOCK, HELP. " +
       "Modifiers: cmd/command/meta, shift, opt/option/alt, ctrl/control, fn. Examples: " +
-      `press_key { key: "P", modifiers: ["cmd"] } for Cmd+P, press_key { key: "S", modifiers: ["cmd", "shift"] } for Cmd+Shift+S.`,
+      `press_key { key: "P", modifiers: ["cmd"] } for Cmd+P, press_key { key: "S", modifiers: ["cmd", "shift"] } for Cmd+Shift+S. ` +
+      "System-level shortcuts (Cmd+Tab, Cmd+Space) bypass postToPid and need bring_to_front=true to work.",
     schema: z.object({
       key: z.string(),
       modifiers: z.array(z.string()).default([]),
     }),
-    handler: async (args) => json(await callHelper("press_key", args)),
+    handler: async (args) => json(await callHelper("press_key", withTargetPid(args))),
   },
   {
     name: "hover",
-    description: "Move the mouse over an element (by ref) or to raw {x,y} coordinates. No click.",
+    description: "Move the mouse over an element (by ref) or to raw {x,y} coordinates. No click. With an active app set, the hover event is routed to that app — in focus-free mode the actual cursor doesn't move.",
     schema: z.object({
       ref: z.number().int().optional(),
       x: z.number().optional(),
       y: z.number().optional(),
     }),
-    handler: async (args) => json(await callHelper("hover", args)),
+    handler: async (args) => json(await callHelper("hover", withTargetPid(args))),
   },
   {
     name: "scroll",
@@ -391,7 +497,7 @@ export const tools: Tool[] = [
       dx: z.number().int().default(0),
       dy: z.number().int().default(-200),
     }),
-    handler: async (args) => json(await callHelper("scroll", args)),
+    handler: async (args) => json(await callHelper("scroll", withTargetPid(args))),
   },
   {
     name: "try_click",
@@ -403,7 +509,7 @@ export const tools: Tool[] = [
       const hit = a.ref != null ? { ref: a.ref } : await resolveRef(a);
       if (!hit) return json({ clicked: false, reason: "no match" });
       try {
-        await callHelper("click", { ref: hit.ref });
+        await callHelper("click", withTargetPid({ ref: hit.ref }));
         return json({ clicked: true, ref: hit.ref });
       } catch (e) {
         return json({ clicked: false, reason: (e as Error).message });
@@ -498,7 +604,7 @@ export const tools: Tool[] = [
       occurrence_index: z.number().int().min(0).default(0),
       exact: z.boolean().default(false).describe("true = exact string equality (case-sensitive). false = case-insensitive substring."),
     }),
-    handler: async (args) => json(await callHelper("click_text", args)),
+    handler: async (args) => json(await callHelper("click_text", withTargetPid(args))),
   },
 
   // ---- Capture ----

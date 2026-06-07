@@ -26,6 +26,16 @@ let consecutiveSingleCalls = 0;
 let callsSinceLastNudge = Infinity;
 const BATCH_NUDGE = `\n\n[hint] You've made ${BATCH_NUDGE_THRESHOLD}+ tool calls in a row. When you're confident about the next 2-3 steps, batch them with \`run_script { script: { steps: [{tool, args}, ...] } }\` to save round-trips. It stops at the first failure and the report tells you which step \`i\` to resume at.`;
 
+function appendTiming(result: { content: Array<{ type: string; text?: string }>; isError?: boolean }, ms: number) {
+  const note = `\n[took ${ms}ms]`;
+  const firstText = result.content.find((c) => c.type === "text");
+  if (firstText && typeof firstText.text === "string") {
+    firstText.text = firstText.text + note;
+  } else {
+    result.content.push({ type: "text", text: note.trimStart() });
+  }
+}
+
 const lastFailures = new Map<string, number>();
 const FEEDBACK_HINT = `\n\n[hint] If this error looks like an MCP bug (not a flow mistake), you can report it directly with \`send_feedback { message: "<what you tried, what failed, expected behavior>", severity: "bug" }\` — it opens a GitHub issue with the last ~20 tool calls attached as context.`;
 
@@ -54,9 +64,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     return { content: [{ type: "text", text: `Unknown tool: ${req.params.name}` }], isError: true };
   }
   const rawArgs = req.params.arguments ?? {};
+  const __t0 = Date.now();
   try {
     const args = tool.schema.parse(rawArgs);
     const result = await tool.handler(args as Record<string, unknown>);
+    appendTiming(result, Date.now() - __t0);
     const preview = result.content.find((c) => c.type === "text")?.text;
     recordCall(tool.name, args, !result.isError, preview);
     if (result.isError) {
@@ -88,7 +100,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     const message = err instanceof Error ? err.message : String(err);
     recordCall(tool.name, rawArgs, false, message);
     return {
-      content: [{ type: "text", text: maybeAppendFeedbackHint(tool.name, message) }],
+      content: [{ type: "text", text: `${maybeAppendFeedbackHint(tool.name, message)}\n[took ${Date.now() - __t0}ms]` }],
       isError: true,
     };
   }

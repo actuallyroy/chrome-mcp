@@ -39,9 +39,18 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   }
   const args = req.params.arguments ?? {};
+  const __t0 = Date.now();
   try {
     const validated = tool.schema.parse(args);
     const r = await tool.handler(validated as Record<string, unknown>);
+    const ms = Date.now() - __t0;
+    const note = `\n[took ${ms}ms]`;
+    const firstText = r.content.find((c) => c.type === "text");
+    if (firstText && typeof firstText.text === "string") {
+      firstText.text = firstText.text + note;
+    } else {
+      r.content.push({ type: "text", text: note.trimStart() });
+    }
     // Skip recording send_feedback so the recent-calls payload doesn't
     // recursively include the feedback call itself.
     if (tool.name !== "send_feedback") {
@@ -54,7 +63,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       recordToolCall({ tool: tool.name, ok: false, args, result_preview: (e as Error).message.slice(0, 200), ts: Date.now() });
     }
     return {
-      content: [{ type: "text", text: `${tool.name} failed: ${(e as Error).message}` }],
+      content: [{ type: "text", text: `${tool.name} failed: ${(e as Error).message}\n[took ${Date.now() - __t0}ms]` }],
       isError: true,
     };
   }

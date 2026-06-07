@@ -1,6 +1,6 @@
 {
   "name": "windows-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "MCP server that drives Windows desktop applications via UI Automation + Windows.Media.Ocr (chrome-mcp pattern)",
   "type": "module",
   "bin": {

@@ -34,22 +34,34 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   })),
 }));
 
+function appendTiming(result: { content: Array<{ type: string; text?: string }>; isError?: boolean }, ms: number) {
+  const note = `\n[took ${ms}ms]`;
+  const firstText = result.content.find((c) => c.type === "text");
+  if (firstText && typeof firstText.text === "string") {
+    firstText.text = firstText.text + note;
+  } else {
+    result.content.push({ type: "text", text: note.trimStart() });
+  }
+}
+
 server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const tool = tools.find((t) => t.name === req.params.name);
   if (!tool) {
     return { content: [{ type: "text", text: `Unknown tool: ${req.params.name}` }], isError: true };
   }
   const rawArgs = req.params.arguments ?? {};
+  const __t0 = Date.now();
   try {
     const args = tool.schema.parse(rawArgs);
     const result = await tool.handler(args as Record<string, unknown>);
+    appendTiming(result, Date.now() - __t0);
     const preview = result.content.find((c) => c.type === "text")?.text;
     recordCall(tool.name, args, !result.isError, preview);
     return result;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     recordCall(tool.name, rawArgs, false, message);
-    return { content: [{ type: "text", text: message }], isError: true };
+    return { content: [{ type: "text", text: `${message}\n[took ${Date.now() - __t0}ms]` }], isError: true };
   }
 });
 
