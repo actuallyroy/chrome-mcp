@@ -1,5 +1,6 @@
 import { findElement } from "./uiautomator2.js";
 import { resolveRef, getTree, type Node } from "./outline.js";
+import { isRecording } from "./recorder.js";
 
 export type LocatorArgs = {
   ref?: number;
@@ -13,6 +14,13 @@ export type LocatorArgs = {
 
 // Resolve a locator to an Appium element id.
 export async function resolveElementId(loc: LocatorArgs): Promise<string> {
+  if (loc.ref != null && isRecording()) {
+    throw new Error(
+      `ref=${loc.ref} can't be used while recording — refs are tied to a single outline() snapshot and won't survive replay. ` +
+        `Target this element by text, desc, id, or selector instead (those are stable across runs). ` +
+        `Call outline() to see the element's text/desc/id.`,
+    );
+  }
   if (loc.ref != null) {
     // We have the ref→path mapping; we need to translate that to a selector
     // the server can find. We use the node's `resource-id` / bounds / text.

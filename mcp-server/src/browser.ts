@@ -147,6 +147,15 @@ export async function launchChrome(opts: { headless?: boolean } = {}): Promise<{
   const args = [
     `--remote-debugging-port=${DEFAULT_PORT}`,
     `--user-data-dir=${profile}`,
+    // Suppress browser-native bubbles that the MCP can't see or dismiss and that
+    // block the page until a human closes them. The big one: submitting a known-
+    // leaked password (e.g. "password") triggers Chrome's "Change your password —
+    // found in a data breach" warning, which steals focus and stalls automation.
+    "--disable-features=PasswordLeakDetection,PasswordChangeInSettings,AutofillServerCommunication",
+    "--disable-save-password-bubble",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-session-crashed-bubble",
   ];
   if (opts.headless) args.push("--headless=new");
   const child = spawn(bin, args, {

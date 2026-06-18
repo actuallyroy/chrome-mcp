@@ -27,6 +27,27 @@ export function getRecentCalls(): FlowEntry[] {
 // Tools that record themselves shouldn't be recorded (infinite recursion in logs).
 const META_TOOLS = new Set(["start_recording", "stop_recording", "recording_status"]);
 
+// Read-only inspection tools: they observe page state but don't mutate it, so
+// replaying them is a no-op. We keep them out of the saved flow (state.entries)
+// but still buffer them in `recent` for feedback/diagnostics context.
+// Waits (wait_for_*) and assertions are deliberately NOT here — they carry
+// synchronization / checkpoint value on replay.
+const READ_ONLY_TOOLS = new Set([
+  "outline", "describe", "screenshot", "snapshot",
+  "get_text", "get_html", "get_url", "get_title", "get_attribute",
+  "get_toasts", "get_console", "get_network", "get_cookies",
+  "list_tabs",
+]);
+
+// Tools that mutate / act but still don't belong in a replayable flow:
+//  - pause/resume block on a human and would stall replay
+//  - run_script runs another flow (meta, not a UI step)
+//  - launch_chrome is session bootstrap, not a user action
+// Kept in `recent` for diagnostics, excluded from the saved flow.
+const NON_REPLAYABLE_TOOLS = new Set([
+  "pause", "resume", "run_script", "launch_chrome",
+]);
+
 export function isRecording(): boolean {
   return state.active;
 }
@@ -71,7 +92,11 @@ export function recordCall(tool: string, args: unknown, ok: boolean, preview?: s
   };
   recent.push(entry);
   while (recent.length > RECENT_MAX) recent.shift();
-  if (state.active) state.entries.push(entry);
+  // Read-only and non-replayable (interactive / meta) calls are kept in `recent`
+  // for diagnostics but excluded from the saved flow.
+  if (state.active && !READ_ONLY_TOOLS.has(tool) && !NON_REPLAYABLE_TOOLS.has(tool)) {
+    state.entries.push(entry);
+  }
 }
 
 export function recorderStatus() {

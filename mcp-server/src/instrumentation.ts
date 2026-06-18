@@ -135,8 +135,15 @@ export const INSTRUMENTATION_SCRIPT = `
       else if (inner.includes(target)) partial.push(e);
     }
     const ordered = [...exact, ...partial];
+    if (typeof window.__mcp.__nextRef !== 'number') window.__mcp.__nextRef = 1;
     return ordered.map(e => {
-      const ref = e.getAttribute('data-mcp-ref');
+      // Stamp a ref if the element doesn't have one yet, so the ambiguity
+      // report returns usable refs without a separate outline() call (#37).
+      let ref = e.getAttribute('data-mcp-ref');
+      if (!ref) {
+        ref = String(window.__mcp.__nextRef++);
+        e.setAttribute('data-mcp-ref', ref);
+      }
       const inner = (e.innerText || e.textContent || '').trim();
       const aria = (e.getAttribute('aria-label') || '').trim();
       return {

@@ -26,8 +26,16 @@ function findVendoredSqlite3(): string | null {
   return candidates.find((p) => existsSync(p)) || null;
 }
 
+// How we reach into the app sandbox, resolved once per package:
+//  - 'run-as': app is debuggable, `run-as <pkg>` works (the normal path)
+//  - 'root':   run-as refused (non-debuggable app) but the device has root,
+//              so we shell in via `su 0` (issue #20)
+//  - 'cd':     neither — best-effort `cd <dataDir>` (emulators where the dir
+//              is world-accessible to the shell user)
+type AccessMode = "run-as" | "root" | "cd";
+
 type PkgState = {
-  runAsWorks: boolean | null;
+  access: AccessMode | null;
   appDataDir: string;
   sqlite3Path: string; // resolved path to sqlite3 binary, runnable via runAs()
 };
@@ -37,7 +45,7 @@ const cache = new Map<string, PkgState>();
 function getState(pkg: string): PkgState {
   let s = cache.get(pkg);
   if (!s) {
-    s = { runAsWorks: null, appDataDir: "", sqlite3Path: "" };
+    s = { access: null, appDataDir: "", sqlite3Path: "" };
     cache.set(pkg, s);
   }
   return s;
@@ -48,34 +56,72 @@ export function clearSqliteCache(pkg?: string) {
   else cache.clear();
 }
 
-async function probeRunAs(pkg: string): Promise<void> {
-  const s = getState(pkg);
-  if (s.runAsWorks !== null) return;
+// Is `su 0` (root) available on this device? Cached for the session.
+let rootAvailable: boolean | null = null;
+export async function hasRoot(): Promise<boolean> {
+  if (rootAvailable !== null) return rootAvailable;
   try {
-    await adbShell(`run-as ${pkg} id`);
-    s.runAsWorks = true;
-    return;
-  } catch { /* fall back */ }
-  s.runAsWorks = false;
+    const id = await adbShell("su 0 id 2>/dev/null");
+    rootAvailable = /uid=0/.test(id);
+  } catch {
+    rootAvailable = false;
+  }
+  return rootAvailable;
+}
+
+// Escape a string so it survives one extra layer of double-quoted shell parsing
+// (needed when wrapping an already-built command in `su 0 sh -c "..."`).
+function reEscapeForDoubleQuote(s: string): string {
+  return s.replace(/([\\"$`])/g, "\\$1");
+}
+
+async function resolveDataDir(pkg: string): Promise<string> {
   try {
     const info = await adbShell(`dumpsys package ${pkg} | grep dataDir | head -1`);
     const m = info.match(/dataDir=(.+)/);
-    s.appDataDir = m ? m[1].trim() : `/data/data/${pkg}`;
+    return m ? m[1].trim() : `/data/data/${pkg}`;
   } catch {
-    s.appDataDir = `/data/data/${pkg}`;
+    return `/data/data/${pkg}`;
   }
 }
 
-// Run a shell command as the app — uses run-as when available, otherwise
-// shells into the app's data dir directly (works on rooted/emulator envs
-// where /data/data/<pkg> is world-readable to shell).
-export async function runAs(pkg: string, command: string): Promise<string> {
-  await probeRunAs(pkg);
+async function probeAccess(pkg: string): Promise<void> {
   const s = getState(pkg);
-  if (s.runAsWorks) {
-    return (await adbShell(`run-as ${pkg} ${command}`)).replace(/\r\n/g, "\n").trimEnd();
+  if (s.access !== null) return;
+  try {
+    await adbShell(`run-as ${pkg} id`);
+    s.access = "run-as";
+    return;
+  } catch { /* run-as refused (non-debuggable app) — try root, then plain cd */ }
+  s.appDataDir = await resolveDataDir(pkg);
+  s.access = (await hasRoot()) ? "root" : "cd";
+}
+
+// Run a shell command as the app — uses run-as when available, falls back to
+// `su 0` (root) for non-debuggable apps on rooted devices (issue #20), and
+// finally to a plain `cd <dataDir>` for envs where the dir is world-accessible.
+export async function runAs(pkg: string, command: string): Promise<string> {
+  await probeAccess(pkg);
+  const s = getState(pkg);
+  let full: string;
+  if (s.access === "run-as") {
+    full = `run-as ${pkg} ${command}`;
+  } else if (s.access === "root") {
+    // Wrap in `su 0 sh -c "..."`. The inner command keeps its original
+    // (single-level) quoting; we only re-escape so the outer device shell
+    // hands `sh -c` the command verbatim.
+    full = `su 0 sh -c "${reEscapeForDoubleQuote(`cd ${s.appDataDir} && ${command}`)}"`;
+  } else {
+    full = `cd ${s.appDataDir} && ${command}`;
   }
-  return (await adbShell(`cd ${s.appDataDir} && ${command}`)).replace(/\r\n/g, "\n").trimEnd();
+  return (await adbShell(full)).replace(/\r\n/g, "\n").trimEnd();
+}
+
+// Whether the resolved access path for this package is root (`su 0`). Callers
+// use this to take the root-aware branch (e.g. pulling a DB via `su 0 cat`).
+export async function accessModeFor(pkg: string): Promise<AccessMode> {
+  await probeAccess(pkg);
+  return getState(pkg).access || "cd";
 }
 
 // Find a usable sqlite3 binary. Prefers an app-local copy (so run-as can exec
@@ -161,6 +207,15 @@ export async function ensureSqlite3(pkg: string): Promise<string> {
 // Get debuggable third-party packages (those run-as can attach to). Falls
 // back to all third-party packages if the run-as probe finds none.
 export async function listDebuggablePackages(): Promise<string[]> {
+  // On a rooted device, `su 0` can reach every app's sandbox, so list all
+  // third-party packages — not just the debuggable ones run-as can attach to
+  // (issue #20: non-debuggable production apps were invisible before).
+  if (await hasRoot()) {
+    const all = await adbShell('pm list packages -3 2>/dev/null | tr -d "\\r" | sed "s/package://"');
+    const pkgs = all.split("\n").map((l) => l.trim()).filter(Boolean);
+    pkgs.sort();
+    return pkgs;
+  }
   const probe =
     'for p in $(pm list packages --user 0 -3 2>/dev/null | tr -d "\\r" | sed "s/package://"); do ' +
     "run-as $p id 2>/dev/null 1>/dev/null && echo $p; done";
@@ -317,11 +372,19 @@ export async function pullDatabase(
   // Stage in /data/local/tmp via run-as cat (works even when adb pull can't
   // see inside the app sandbox).
   const stage = `/data/local/tmp/_android_mcp_pull_${Date.now()}.db`;
-  await adbShell(`run-as ${pkg} cat "${resolved}" > ${stage}`).catch(async () => {
-    // Non-run-as fallback: try direct cp via shell user.
-    const s = getState(pkg);
+  const mode = await accessModeFor(pkg);
+  const s = getState(pkg);
+  if (mode === "run-as") {
+    await adbShell(`run-as ${pkg} cat "${resolved}" > ${stage}`).catch(async () => {
+      await adbShell(`cp "${s.appDataDir}/${resolved}" ${stage}`);
+    });
+  } else if (mode === "root") {
+    // Root: copy out via `su 0`, then make the staged file readable to adb pull.
+    await adbShell(`su 0 cat "${s.appDataDir}/${resolved}" > ${stage}`);
+    await adbShell(`su 0 chmod 666 ${stage}`).catch(() => { /* ignore */ });
+  } else {
     await adbShell(`cp "${s.appDataDir}/${resolved}" ${stage}`);
-  });
+  }
   try {
     await adb(["pull", stage, destPath], { timeout_ms: 60_000 });
     const sizeOut = await adbShell(`stat -c %s ${stage} 2>/dev/null || wc -c < ${stage}`);

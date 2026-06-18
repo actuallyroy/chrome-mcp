@@ -70,6 +70,7 @@ import { dirname } from "node:path";
 import { fileFeedback } from "./feedback.js";
 import {
   getRecentCalls,
+  isRecording,
   recorderStatus,
   startRecording,
   stopRecording,
@@ -160,6 +161,13 @@ export function takeAmbiguity(): { locator_text: string; candidates: Candidate[]
 
 async function resolveLocator(page: Page, loc: LocatorArgs): Promise<ElementHandle<Element>> {
   lastAmbiguity = null;
+  if (loc.ref != null && isRecording()) {
+    throw new Error(
+      `ref=${loc.ref} can't be used while recording — refs are tied to a single outline() snapshot and won't survive replay. ` +
+        `Target this element by text, label, or selector instead (those are stable across runs). ` +
+        `Call outline() to see the element's text/label.`,
+    );
+  }
   if (loc.ref != null) {
     const h = await page.$(`[data-mcp-ref="${loc.ref}"]`);
     if (h) return h;
@@ -203,6 +211,204 @@ async function resolveLocator(page: Page, loc: LocatorArgs): Promise<ElementHand
   throw new Error("Provide one of: ref, text, label, or selector.");
 }
 
+// Resolve a locator, retrying briefly if it isn't found yet. SPAs frequently
+// re-render between steps (a fill's blur revalidates the form, a menu animates
+// open, a route hydrates), which momentarily detaches the target. A scripted
+// flow runs steps back-to-back with no human pause, so without this a transient
+// re-render turns into a hard "no element" failure. We poll until the element
+// appears or `timeoutMs` elapses. Usage errors and the recording ref-guard are
+// not retried — they won't fix themselves.
+async function resolveLocatorRetrying(
+  page: Page,
+  loc: LocatorArgs,
+  timeoutMs = 4000,
+): Promise<ElementHandle<Element>> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try {
+      return await resolveLocator(page, loc);
+    } catch (e) {
+      const msg = (e as Error).message || "";
+      if (/while recording|Provide one of/.test(msg) || Date.now() >= deadline) throw e;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+  }
+}
+
+// A page condition, shared by `assert` (throws on false) and run_script
+// `when`/`unless` step guards (skip on false/true). First populated field wins.
+type ConditionArgs = {
+  url_contains?: string;
+  text_visible?: string;
+  toast?: string;
+  element?: LocatorArgs;
+};
+
+const ConditionShape = {
+  url_contains: z.string().optional(),
+  text_visible: z.string().optional(),
+  toast: z.string().optional(),
+  element: z
+    .object({
+      ref: z.number().int().optional(),
+      text: z.string().optional(),
+      label: z.string().optional(),
+      selector: z.string().optional(),
+    })
+    .optional(),
+};
+
+// A single run_script step. `when`/`unless` gate execution; `params` placeholders
+// in args are substituted before the step runs.
+const StepShape = z.object({
+  tool: z.string(),
+  args: z.record(z.any()).optional(),
+  skip: z.boolean().optional(),
+  on_error: z.enum(["continue", "stop"]).optional(),
+  when: z.object(ConditionShape).optional(),
+  unless: z.object(ConditionShape).optional(),
+});
+
+type StepEntry = {
+  tool: string;
+  args?: Record<string, unknown>;
+  skip?: boolean;
+  on_error?: "continue" | "stop";
+  when?: ConditionArgs;
+  unless?: ConditionArgs;
+};
+
+// Substitute {{name}} placeholders in any string within a value, recursively.
+// A whole-string "{{name}}" yields the raw param value (preserving type);
+// embedded placeholders are stringified.
+function substituteParams<T>(value: T, params: Record<string, unknown>): T {
+  if (typeof value === "string") {
+    const whole = value.match(/^\{\{\s*([\w.]+)\s*\}\}$/);
+    if (whole && whole[1] in params) return params[whole[1]] as unknown as T;
+    return value.replace(/\{\{\s*([\w.]+)\s*\}\}/g, (m, k) =>
+      k in params ? String(params[k]) : m,
+    ) as unknown as T;
+  }
+  if (Array.isArray(value)) return value.map((v) => substituteParams(v, params)) as unknown as T;
+  if (value && typeof value === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value)) out[k] = substituteParams(v, params);
+    return out as T;
+  }
+  return value;
+}
+
+// Tools whose effect can ripple after they return (navigation, re-render,
+// async data loads). After one of these runs inside a script we wait for the
+// page to go quiet before the next step, so locators don't race the churn.
+const MUTATING_TOOLS = new Set([
+  "navigate", "go_back", "go_forward", "reload",
+  "click", "fill", "fill_form", "type", "press", "select_option", "set_input_files", "hover",
+]);
+
+// Wait for the page to "settle" before the next scripted step:
+//   1. network idle  — no in-flight fetch/XHR for a beat (SPA data loads)
+//   2. DOM idle       — no mutations for a beat (route changes, render/animation)
+//   3. (after a full navigation only) main-thread idle — no Long Tasks for a beat
+//
+// (3) is the generic, framework-agnostic fix for the hydration race: a freshly
+// loaded SSR page paints buttons/links that LOOK ready but whose click handlers
+// aren't bound yet, so the first click is a silent no-op. Hydration emits no
+// network or DOM mutation (so 1 and 2 miss it) — but it runs as Long Tasks on
+// the main thread. Once the main thread has been quiet (no longtask) for a beat,
+// the heavy synchronous work, including hydration, is done. This needs no
+// knowledge of React/Vue/etc. Everything here is fully bounded and swallows all
+// errors (a navigation mid-settle is success, not failure).
+async function settlePage(page: Page, opts?: { afterNav?: boolean }): Promise<void> {
+  try {
+    await page.waitForNetworkIdle({ idleTime: 350, timeout: 5000 });
+  } catch { /* idle never reached within cap — proceed */ }
+  try {
+    await page.evaluate(
+      (quiet: number, cap: number) =>
+        new Promise<void>((resolve) => {
+          let timer: ReturnType<typeof setTimeout>;
+          const finish = () => {
+            try { obs.disconnect(); } catch { /* ignore */ }
+            resolve();
+          };
+          const obs = new MutationObserver(() => {
+            clearTimeout(timer);
+            timer = setTimeout(finish, quiet);
+          });
+          obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+          timer = setTimeout(finish, quiet);
+          setTimeout(finish, cap); // hard cap so constant animations can't hang us
+        }),
+      350,
+      4000,
+    );
+  } catch { /* context destroyed by navigation = settled enough */ }
+  if (opts?.afterNav) {
+    try {
+      await page.evaluate(
+        (quiet: number, cap: number) =>
+          new Promise<void>((resolve) => {
+            const start = Date.now();
+            let lastBusy = Date.now();
+            let po: PerformanceObserver | undefined;
+            try {
+              po = new PerformanceObserver((list) => {
+                if (list.getEntries().length) lastBusy = Date.now();
+              });
+              // buffered:true surfaces long tasks that already ran (incl. the
+              // initial hydration burst) before we started observing.
+              po.observe({ type: "longtask", buffered: true } as PerformanceObserverInit);
+            } catch {
+              // longtask unsupported — fall back to a single idle tick.
+              return resolve();
+            }
+            const tick = () => {
+              if (Date.now() - lastBusy >= quiet || Date.now() - start > cap) {
+                try { po && po.disconnect(); } catch { /* ignore */ }
+                resolve();
+              } else {
+                setTimeout(tick, 50);
+              }
+            };
+            setTimeout(tick, 50);
+          }),
+        450,
+        4000,
+      );
+    } catch { /* ignore */ }
+  }
+}
+
+// Evaluate a condition without throwing. Returns whether it holds plus a short
+// description for reporting.
+async function evalCondition(page: Page, cond: ConditionArgs): Promise<{ ok: boolean; detail: string }> {
+  if (cond.url_contains != null) {
+    return { ok: page.url().includes(cond.url_contains), detail: `url contains "${cond.url_contains}"` };
+  }
+  if (cond.text_visible != null) {
+    const ok = await page.evaluate((needle: string) => document.body.innerText.includes(needle), cond.text_visible);
+    return { ok, detail: `text "${cond.text_visible}" visible` };
+  }
+  if (cond.toast != null) {
+    const ok = await page.evaluate((needle: string) => {
+      const w = window as unknown as { __mcp: { toasts: { text: string }[] } };
+      const q = needle.toLowerCase();
+      return !!w.__mcp.toasts.find((x) => x.text.toLowerCase().includes(q));
+    }, cond.toast);
+    return { ok, detail: `toast "${cond.toast}" seen` };
+  }
+  if (cond.element != null) {
+    try {
+      await resolveLocator(page, cond.element);
+      return { ok: true, detail: `element present` };
+    } catch {
+      return { ok: false, detail: `element present` };
+    }
+  }
+  throw new Error("condition: provide one of url_contains / text_visible / toast / element");
+}
+
 function appendAmbiguity(result: ToolResult): ToolResult {
   const a = takeAmbiguity();
   if (!a) return result;
@@ -220,15 +426,65 @@ function appendAmbiguity(result: ToolResult): ToolResult {
 
 async function clickHandle(page: Page, h: ElementHandle<Element>) {
   await h.evaluate((el) => (el as HTMLElement).scrollIntoView({ block: "center", behavior: "instant" as ScrollBehavior }));
-  // h.click() ends with a Runtime.callFunctionOn that resolves only after the
-  // page's click handler returns. For form-submits / heavy SPA buttons that
-  // start synchronous work, that round-trip can hit puppeteer's protocolTimeout
-  // even though the click already fired. Instead, get the click point once,
-  // then dispatch raw mouse events via CDP — those are fire-and-forget and
-  // don't wait for handler completion.
+  // For standard activatable elements (buttons, links, menu items, form
+  // controls), dispatch a real DOM click via el.click(). A synthesized CDP
+  // coordinate click can silently fail to activate React/Radix handlers that
+  // listen on pointer events or re-render mid-interaction — we saw sidebar
+  // collapsibles toggle only intermittently with mouse.click(). el.click()
+  // always fires the element's own activation path. It's scheduled in a
+  // macrotask so this evaluate returns immediately: the handler runs
+  // fire-and-forget and can't stall on puppeteer's protocolTimeout even when
+  // onClick kicks off heavy synchronous work (the reason we avoid h.click()).
+  const isActivatable = await h.evaluate((el) => {
+    const e = el as HTMLElement;
+    const tag = e.tagName.toLowerCase();
+    const role = e.getAttribute("role") || "";
+    const type = ((e as HTMLInputElement).type || "").toLowerCase();
+    return (
+      ["a", "button", "summary", "label"].includes(tag) ||
+      (tag === "input" && ["submit", "button", "reset", "checkbox", "radio"].includes(type)) ||
+      [
+        "button", "link", "menuitem", "menuitemcheckbox", "menuitemradio",
+        "tab", "option", "checkbox", "radio", "switch",
+      ].includes(role)
+    );
+  });
+  if (isActivatable) {
+    // Dispatch a real DOM click and verify it had an effect, retrying if not.
+    // Why: a synthesized click can land on an element whose handler isn't bound
+    // yet (post-navigation hydration), producing a silent no-op — this is
+    // non-deterministic, so a single attempt is unreliable. We retry ONLY when
+    // the click produced no observable change. Crucially, a click that fired a
+    // network request (or navigated, or mutated the DOM) is treated as having
+    // worked and is never repeated — so non-idempotent actions like Save can't
+    // double-submit.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const snap = await h
+        .evaluate((el) => {
+          const w = (window as unknown as { __mcp?: { network?: unknown[] } }).__mcp;
+          const net = (w && w.network && w.network.length) || 0;
+          (el as HTMLElement).click();
+          return { net, url: location.href, els: document.getElementsByTagName("*").length };
+        })
+        .catch(() => null);
+      if (!snap) return; // execution context gone = the click navigated = success
+      await new Promise((r) => setTimeout(r, attempt === 0 ? 150 : 250));
+      const changed = await page
+        .evaluate((s: { net: number; url: string; els: number }) => {
+          const w = (window as unknown as { __mcp?: { network?: unknown[] } }).__mcp;
+          const net = (w && w.network && w.network.length) || 0;
+          return net > s.net || location.href !== s.url || document.getElementsByTagName("*").length !== s.els;
+        }, snap)
+        .catch(() => true); // navigation destroyed context = changed = success
+      if (changed) return;
+    }
+    return;
+  }
+  // Non-activatable target (cursor:pointer div, canvas region, etc.): fall back
+  // to a real coordinate click via CDP — fire-and-forget at the protocol level,
+  // so it doesn't wait on handler completion.
   const box = await h.boundingBox();
   if (!box) {
-    // Element has no layout (display:none, detached). Fall back to h.click().
     await h.click();
     return;
   }
@@ -368,7 +624,7 @@ export const tools: Tool[] = [
               __mcp: { network: { url: string; method: string; status: number | null; ms: number | null; kind: string; opaque?: boolean; req_body?: string | null; resp_body?: string | null }[] };
             };
             let list = [...w.__mcp.network];
-            if (filter) list = list.filter((e) => e.url.includes(filter));
+            if (filter) list = list.filter((e) => String(e.url).includes(filter));
             list = list.slice(-lim);
             if (shouldClear) w.__mcp.network.length = 0;
             if (!withBody) {
@@ -392,7 +648,7 @@ export const tools: Tool[] = [
     schema: z.object(Locator),
     handler: async (args) =>
       withPage(async (p) => {
-        const h = await resolveLocator(p, args as LocatorArgs);
+        const h = await resolveLocatorRetrying(p, args as LocatorArgs);
         const info = await h.evaluate((el) => {
           const w = window as unknown as {
             __mcp: { describeElement(e: Element): unknown };
@@ -430,7 +686,7 @@ export const tools: Tool[] = [
           dialog_action: "accept" | "dismiss";
           prompt_text?: string;
         };
-        const h = await resolveLocator(p, loc);
+        const h = await resolveLocatorRetrying(p, loc);
         await h.evaluate((el) => (el as HTMLElement).scrollIntoView({ block: "center", behavior: "instant" as ScrollBehavior }));
         const watermark = Date.now();
         // Arm the dialog handler for whatever the click triggers. Default is
@@ -439,15 +695,24 @@ export const tools: Tool[] = [
         if (dialog_action === "dismiss" || prompt_text !== undefined) {
           armNextDialog(p, dialog_action, prompt_text);
         }
-        const box = await h.boundingBox();
-        if (box) {
-          const x = box.x + box.width / 2;
-          const y = box.y + box.height / 2;
-          // Raw mouse events via CDP are fire-and-forget; h.click() waits on
-          // Runtime.callFunctionOn which times out on heavy form-submit handlers.
-          await p.mouse.click(x, y, { button, count: click_count });
+        if (button === "left" && click_count === 1) {
+          // Default click: route through clickHandle, which dispatches a real
+          // DOM activation and verifies/retries it. A synthesized coordinate
+          // click intermittently fails to fire React/Radix handlers (esp. right
+          // after navigation, before hydration binds them).
+          await clickHandle(p, h);
         } else {
-          await h.click({ button, count: click_count });
+          // Right/middle/multi-click need true pointer semantics — use CDP
+          // coordinate events (fire-and-forget; h.click() would wait on
+          // Runtime.callFunctionOn and can time out on heavy handlers).
+          const box = await h.boundingBox();
+          if (box) {
+            const x = box.x + box.width / 2;
+            const y = box.y + box.height / 2;
+            await p.mouse.click(x, y, { button, count: click_count });
+          } else {
+            await h.click({ button, count: click_count });
+          }
         }
         // Brief wait so a sync confirm() the click triggered has time to fire
         // and be auto-handled before we sample dialogsSince.
@@ -479,7 +744,7 @@ export const tools: Tool[] = [
           capture_toast: boolean;
           toast_wait_ms: number;
         };
-        const h = await resolveLocator(p, loc);
+        const h = await resolveLocatorRetrying(p, loc);
         const watermark = Date.now();
         await fillHandle(p, h, value);
         let result = text(`filled (${loc.ref ? `ref=${loc.ref}` : loc.label ? `label="${loc.label}"` : loc.selector})`);
@@ -509,7 +774,7 @@ export const tools: Tool[] = [
         for (const fp of paths) {
           if (!existsSync(fp)) throw new Error(`set_input_files: file not found at ${fp} (must be an absolute path)`);
         }
-        const h = await resolveLocator(p, loc);
+        const h = await resolveLocatorRetrying(p, loc);
         const isFileInput = await h.evaluate((el) =>
           el.tagName === "INPUT" && (el as HTMLInputElement).type === "file",
         );
@@ -543,7 +808,7 @@ export const tools: Tool[] = [
         };
         const filled: string[] = [];
         for (const f of fields) {
-          const h = await resolveLocator(p, f);
+          const h = await resolveLocatorRetrying(p, f);
           await fillHandle(p, h, f.value);
           filled.push(f.label || (f.ref ? `ref=${f.ref}` : f.selector || ""));
         }
@@ -567,10 +832,13 @@ export const tools: Tool[] = [
           capture_toast: boolean;
           toast_wait_ms: number;
         };
-        const trigger = await resolveLocator(p, loc);
-        await trigger.evaluate((el) => (el as HTMLElement).scrollIntoView({ block: "center", behavior: "instant" as ScrollBehavior }));
+        const trigger = await resolveLocatorRetrying(p, loc);
         const watermark = Date.now();
-        await trigger.click();
+        // Use the CDP fire-and-forget click (not trigger.click()): opening a
+        // Radix/shadcn combobox can kick off a heavy React render whose
+        // Runtime.callFunctionOn round-trip otherwise stalls to the 180s
+        // protocolTimeout even though the trigger already opened (issue #41).
+        await clickHandle(p, trigger);
         // Wait for an option to appear (Radix portal renders outside the trigger).
         await p.waitForFunction(
           () => document.querySelectorAll('[role="option"]').length > 0,
@@ -649,7 +917,7 @@ export const tools: Tool[] = [
     schema: z.object(Locator),
     handler: async (args) =>
       withPage(async (p) => {
-        const h = await resolveLocator(p, args as LocatorArgs);
+        const h = await resolveLocatorRetrying(p, args as LocatorArgs);
         await h.hover();
         return text(`hovered`);
       }),
@@ -667,7 +935,7 @@ export const tools: Tool[] = [
       withPage(async (p) => {
         const a = args as LocatorArgs & { dx: number; dy: number };
         if (a.ref != null || a.text || a.label || a.selector) {
-          const h = await resolveLocator(p, a);
+          const h = await resolveLocatorRetrying(p, a);
           await h.evaluate((el) => (el as HTMLElement).scrollIntoView({ block: "center", behavior: "instant" as ScrollBehavior }));
           return text("scrolled into view");
         }
@@ -687,17 +955,39 @@ export const tools: Tool[] = [
         .default("domcontentloaded"),
       capture_toast: z.boolean().default(false),
       toast_wait_ms: z.number().int().min(0).max(10_000).default(1000),
+      timeout_ms: z
+        .number()
+        .int()
+        .min(1000)
+        .max(120_000)
+        .default(30_000)
+        .describe("Max wait for the navigation to reach wait_until before failing with a clear error"),
     }),
     handler: async (args) =>
       withPage(async (p) => {
-        const { url, wait_until, capture_toast, toast_wait_ms } = args as {
+        const { url, wait_until, capture_toast, toast_wait_ms, timeout_ms } = args as {
           url: string;
           wait_until: "load" | "domcontentloaded" | "networkidle0" | "networkidle2";
           capture_toast: boolean;
           toast_wait_ms: number;
+          timeout_ms: number;
         };
         const watermark = Date.now();
-        await p.goto(url, { waitUntil: wait_until });
+        try {
+          await p.goto(url, { waitUntil: wait_until, timeout: timeout_ms });
+        } catch (e) {
+          const msg = (e as Error).message || String(e);
+          // Common on SPAs: the route change never fires the requested lifecycle
+          // event, so goto blocks. Fail fast with an actionable hint (issue #39).
+          if (/timeout|Navigation timeout/i.test(msg)) {
+            throw new Error(
+              `navigate to ${url} did not reach "${wait_until}" within ${timeout_ms}ms. ` +
+                `If this is a client-routed SPA, try wait_until="load", or click the in-app link / ` +
+                `use evaluate("location.href = '...'") instead. (${msg})`,
+            );
+          }
+          throw e;
+        }
         let result = text(`Navigated to ${p.url()}`);
         result = appendDialogs(result, dialogsSince(p, watermark));
         if (capture_toast) {
@@ -1163,54 +1453,12 @@ export const tools: Tool[] = [
     name: "assert",
     description:
       "Assert a condition on the current page. Throws on failure (useful as a script step). Provide one of: url_contains, text_visible, toast (substring), element (locator shape, passes if exists+visible).",
-    schema: z.object({
-      url_contains: z.string().optional(),
-      text_visible: z.string().optional(),
-      toast: z.string().optional(),
-      element: z
-        .object({
-          ref: z.number().int().optional(),
-          text: z.string().optional(),
-          label: z.string().optional(),
-          selector: z.string().optional(),
-        })
-        .optional(),
-    }),
+    schema: z.object(ConditionShape),
     handler: async (args) =>
       withPage(async (p) => {
-        const a = args as {
-          url_contains?: string;
-          text_visible?: string;
-          toast?: string;
-          element?: LocatorArgs;
-        };
-        if (a.url_contains) {
-          const url = p.url();
-          if (!url.includes(a.url_contains))
-            throw new Error(`assert.url_contains failed: "${a.url_contains}" not in ${url}`);
-          return text(`ok (url contains "${a.url_contains}")`);
-        }
-        if (a.text_visible) {
-          const ok = await p.evaluate((needle: string) => {
-            return document.body.innerText.includes(needle);
-          }, a.text_visible);
-          if (!ok) throw new Error(`assert.text_visible failed: "${a.text_visible}" not on page`);
-          return text(`ok (text visible)`);
-        }
-        if (a.toast) {
-          const hit = await p.evaluate((needle: string) => {
-            const w = window as unknown as { __mcp: { toasts: { text: string }[] } };
-            const q = needle.toLowerCase();
-            return w.__mcp.toasts.find((x) => x.text.toLowerCase().includes(q)) || null;
-          }, a.toast);
-          if (!hit) throw new Error(`assert.toast failed: no toast containing "${a.toast}"`);
-          return text(`ok (toast seen)`);
-        }
-        if (a.element) {
-          await resolveLocator(p, a.element); // throws if not found
-          return text(`ok (element present)`);
-        }
-        throw new Error("assert: provide one of url_contains / text_visible / toast / element");
+        const { ok, detail } = await evalCondition(p, args as ConditionArgs);
+        if (!ok) throw new Error(`assert failed: ${detail}`);
+        return text(`ok (${detail})`);
       }),
   },
 
@@ -1223,34 +1471,41 @@ export const tools: Tool[] = [
       `  run_script { script: { steps: [{ tool: "click", args: { ref: 7 } }, { tool: "fill", args: { ref: 9, value: "x" } }, { tool: "click", args: { text: "Submit" } }] } }\n` +
       "  By default it stops at the first failure and the report shows the failing index `i` so you can pivot.\n\n" +
       "(2) **Saved flow** — pass a `path` to a recorded JSON file. Use `start_at` / `end_at` / `only` to re-run from a checkpoint or hot-fix a single step.\n\n" +
-      "Step shape: {tool, args?, skip?, on_error?}. Set `verbose: true` to get full per-step output instead of 200-char previews (useful when you batched in lieu of separate calls).",
+      "Step shape: {tool, args?, skip?, on_error?, when?, unless?}. `when`/`unless` take a condition (url_contains | text_visible | toast | element) — `when` runs the step only if the condition holds, `unless` skips it if the condition holds. Use these for conditional flows (e.g. skip the login steps when already authenticated). " +
+      "Parameters: pass `params` to substitute {{name}} placeholders in step args (and in `when`/`unless`); a flow file may declare defaults under a top-level `params` object. " +
+      "Set `verbose: true` to get full per-step output instead of 200-char previews (useful when you batched in lieu of separate calls).",
     schema: z.object({
       path: z.string().optional(),
       script: z
         .object({
-          steps: z.array(z.object({ tool: z.string(), args: z.record(z.any()).optional() })).optional(),
-          entries: z.array(z.object({ tool: z.string(), args: z.record(z.any()).optional() })).optional(),
+          steps: z.array(StepShape).optional(),
+          entries: z.array(StepShape).optional(),
+          params: z.record(z.any()).optional(),
         })
         .optional(),
+      params: z.record(z.any()).optional().describe("Values for {{placeholder}} substitution in step args. Override any defaults declared in the flow file."),
       continue_on_error: z.boolean().default(false),
       dry_run: z.boolean().default(false),
       start_at: z.number().int().min(0).optional().describe("Skip steps before this index."),
       end_at: z.number().int().min(0).optional().describe("Stop after this index (inclusive)."),
       only: z.number().int().min(0).optional().describe("Run just this single step. Shorthand for start_at == end_at == only."),
       verbose: z.boolean().default(false).describe("Return full per-step output instead of 200-char previews."),
+      settle: z.boolean().default(true).describe("After each mutating step, wait for the page to go quiet (network + DOM idle) before the next step. Keeps scripted runs from racing SPA navigations/renders. Turn off for max speed on simple pages."),
     }),
     handler: async (args) => {
-      const { path, script, continue_on_error, dry_run, start_at, end_at, only, verbose } = args as {
+      const { path, script, params, continue_on_error, dry_run, start_at, end_at, only, verbose, settle } = args as {
         path?: string;
-        script?: { steps?: { tool: string; args?: Record<string, unknown> }[]; entries?: { tool: string; args?: Record<string, unknown> }[] };
+        script?: { steps?: StepEntry[]; entries?: StepEntry[]; params?: Record<string, unknown> };
+        params?: Record<string, unknown>;
         continue_on_error: boolean;
         dry_run: boolean;
         start_at?: number;
         end_at?: number;
         only?: number;
         verbose: boolean;
+        settle: boolean;
       };
-      let parsed: { steps?: { tool: string; args?: Record<string, unknown> }[]; entries?: { tool: string; args?: Record<string, unknown> }[] };
+      let parsed: { steps?: StepEntry[]; entries?: StepEntry[]; params?: Record<string, unknown> };
       if (path) {
         const raw = readFileSync(path, "utf8");
         parsed = JSON.parse(raw);
@@ -1261,6 +1516,8 @@ export const tools: Tool[] = [
       }
       const steps = parsed.steps ?? parsed.entries ?? [];
       if (steps.length === 0) throw new Error("run_script: no steps/entries in script");
+      // Flow-file defaults under top-level `params`, overridden by call-time params.
+      const effectiveParams: Record<string, unknown> = { ...(parsed.params ?? {}), ...(params ?? {}) };
 
       const from = only != null ? only : (start_at ?? 0);
       const to = only != null ? only : (end_at != null ? end_at : steps.length - 1);
@@ -1278,16 +1535,29 @@ export const tools: Tool[] = [
       }[] = [];
 
       for (let i = from; i <= to; i++) {
-        const step = steps[i] as {
-          tool: string;
-          args?: Record<string, unknown>;
-          skip?: boolean;
-          on_error?: "continue" | "stop";
-          name?: string;
-        };
+        const step = steps[i] as StepEntry;
         if (step.skip) {
           report.push({ i, tool: step.tool, ok: true, ms: 0, result_preview: "skipped" });
           continue;
+        }
+        // Conditional guards. Substitute params into the condition first so
+        // guards can reference {{placeholders}} too.
+        if (step.when || step.unless) {
+          const page = await getActivePage();
+          if (step.when) {
+            const { ok, detail } = await evalCondition(page, substituteParams(step.when, effectiveParams));
+            if (!ok) {
+              report.push({ i, tool: step.tool, ok: true, ms: 0, result_preview: `skipped (when ${detail}: false)` });
+              continue;
+            }
+          }
+          if (step.unless) {
+            const { ok, detail } = await evalCondition(page, substituteParams(step.unless, effectiveParams));
+            if (ok) {
+              report.push({ i, tool: step.tool, ok: true, ms: 0, result_preview: `skipped (unless ${detail}: true)` });
+              continue;
+            }
+          }
         }
         if (dry_run) {
           report.push({ i, tool: step.tool, ok: true, ms: 0, result_preview: "(dry run)" });
@@ -1302,7 +1572,8 @@ export const tools: Tool[] = [
         }
         const t0 = Date.now();
         try {
-          const validated = tool.schema.parse(step.args ?? {});
+          const substitutedArgs = substituteParams(step.args ?? {}, effectiveParams);
+          const validated = tool.schema.parse(substitutedArgs);
           const r = await tool.handler(validated as Record<string, unknown>);
           const fullText = r.content.find((c) => c.type === "text")?.text;
           const preview = fullText?.slice(0, 200);
@@ -1317,6 +1588,14 @@ export const tools: Tool[] = [
           };
           if (verbose) entry.result = fullText; else entry.result_preview = preview;
           report.push(entry);
+          // Auto-settle after a mutating step: wait for the page to go quiet
+          // (network + DOM idle) so the next step's locator doesn't race an
+          // in-flight navigation/render. This is what makes scripted runs robust
+          // without the author sprinkling explicit waits between steps.
+          if (settle && MUTATING_TOOLS.has(step.tool)) {
+            const afterNav = ["navigate", "reload", "go_back", "go_forward"].includes(step.tool);
+            await settlePage(await getActivePage(), { afterNav });
+          }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           report.push({ i, tool: step.tool, ok: false, ms: Date.now() - t0, error: msg });
@@ -1359,7 +1638,7 @@ export const tools: Tool[] = [
         }));
       }
       const r = await fileFeedback({
-        message, severity, product: "chrome", version: "0.2.14", context, endpoint,
+        message, severity, product: "chrome", version: "0.3.0", context, endpoint,
       });
       const via = r.authored_by === "user" ? "via your gh CLI" : "via shared bot (install gh + auth to file as yourself)";
       return { content: [{ type: "text", text: `filed issue #${r.issue_number} ${via} — ${r.url}` }] };

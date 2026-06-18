@@ -88,10 +88,18 @@ const RUN_SCRIPT_SKIP_AUTO_DISMISS = new Set<string>([
 
 // Nearest-neighbor PNG downscale so the longest side is <= maxDim. Returns
 // base64. If the image is already small enough, returns the input unchanged.
-function resizePngBase64(b64: string, maxDim: number): string {
+// Returns the (possibly downscaled) PNG plus the dimensions needed to translate
+// screenshot pixel coords back to native device coords for `adb_shell input tap`.
+// `scale` = native / returned, i.e. native = returned_coord * scale (issue #40).
+function resizePngWithMeta(
+  b64: string,
+  maxDim: number,
+): { b64: string; native_w: number; native_h: number; returned_w: number; returned_h: number; scale: number } {
   const src = PNG.sync.read(Buffer.from(b64, "base64"));
   const longest = Math.max(src.width, src.height);
-  if (longest <= maxDim) return b64;
+  if (longest <= maxDim) {
+    return { b64, native_w: src.width, native_h: src.height, returned_w: src.width, returned_h: src.height, scale: 1 };
+  }
   const scale = maxDim / longest;
   const dw = Math.max(1, Math.round(src.width * scale));
   const dh = Math.max(1, Math.round(src.height * scale));
@@ -108,7 +116,18 @@ function resizePngBase64(b64: string, maxDim: number): string {
       dst.data[di + 3] = src.data[si + 3];
     }
   }
-  return PNG.sync.write(dst).toString("base64");
+  return {
+    b64: PNG.sync.write(dst).toString("base64"),
+    native_w: src.width,
+    native_h: src.height,
+    returned_w: dw,
+    returned_h: dh,
+    scale: src.width / dw,
+  };
+}
+
+function resizePngBase64(b64: string, maxDim: number): string {
+  return resizePngWithMeta(b64, maxDim).b64;
 }
 
 export type Tool = {
@@ -309,15 +328,25 @@ export const tools: Tool[] = [
   {
     name: "screenshot",
     description:
-      "PNG screenshot of the current device screen (base64), auto-downscaled to fit the MCP 2000px image limit. Prefer `outline` for navigation and element lookup — it's cheaper, faster, and returns stable refs. Use screenshot only for visual verification, layout bugs, or content the view hierarchy can't describe (canvas, charts, map tiles, rendered images).",
+      "PNG screenshot of the current device screen (base64), auto-downscaled to fit the MCP 2000px image limit. The result also reports native device resolution and the downscale factor — multiply a screenshot pixel coord by `scale` to get the native coord for `adb_shell input tap` (prefer `click`/`tap` by locator instead). Prefer `outline` for navigation and element lookup — it's cheaper, faster, and returns stable refs. Use screenshot only for visual verification, layout bugs, or content the view hierarchy can't describe (canvas, charts, map tiles, rendered images).",
     schema: z.object({
       max_dim: z.number().int().min(256).max(2000).default(1600),
     }),
     handler: async (args) => {
       const { max_dim } = args as { max_dim: number };
       const b64 = await u2Screenshot();
-      const resized = resizePngBase64(b64, max_dim);
-      return { content: [{ type: "image", data: resized, mimeType: "image/png" }] };
+      const m = resizePngWithMeta(b64, max_dim);
+      const meta =
+        m.scale === 1
+          ? `native ${m.native_w}x${m.native_h}, returned at native resolution (scale 1.0 — screenshot coords = device coords).`
+          : `native ${m.native_w}x${m.native_h}, returned ${m.returned_w}x${m.returned_h} (downscaled ${m.scale.toFixed(3)}x). ` +
+            `For adb_shell input tap, multiply screenshot coords by ${m.scale.toFixed(3)}: device_x = shot_x * ${m.scale.toFixed(3)}, device_y = shot_y * ${m.scale.toFixed(3)}.`;
+      return {
+        content: [
+          { type: "image", data: m.b64, mimeType: "image/png" },
+          { type: "text", text: meta },
+        ],
+      };
     },
   },
 
@@ -419,7 +448,7 @@ export const tools: Tool[] = [
   },
   {
     name: "fill",
-    description: "Clear and type into a text field. Locator + value. Automatically falls back to click+adb-input for React Native TextInputs that reject the WebDriver setValue call.",
+    description: "Clear and type into a text field. Locator + value. Automatically falls back to click+adb-input for React Native TextInputs that reject the WebDriver setValue call. Segmented OTP / passcode inputs (e.g. 6 separate boxes with id=otp-input): target the FIRST box and pass the full code as value — most implementations auto-advance, so the digits fan out across the boxes in one call.",
     schema: z.object({ ...Locator, value: z.string() }),
     handler: async (args) => {
       const { value, ...loc } = args as LocatorArgs & { value: string };
@@ -1015,7 +1044,7 @@ export const tools: Tool[] = [
         }));
       }
       const r = await fileFeedback({
-        message, severity, product: "android", version: "0.1.27", context, endpoint,
+        message, severity, product: "android", version: "0.2.0", context, endpoint,
       });
       const via = r.authored_by === "user" ? "via your gh CLI" : "via shared bot (install gh + auth to file as yourself)";
       return text(`filed issue #${r.issue_number} ${via} — ${r.url}`);
