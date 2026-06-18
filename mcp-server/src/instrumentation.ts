@@ -331,6 +331,22 @@ export const INSTRUMENTATION_SCRIPT = `
   function installNetworkCapture() {
     if (window.__mcp._networkInstalled) return;
     window.__mcp.network = [];
+    // Cap how much body we retain so a single large upload/response can't
+    // blow up memory or the get_network payload. Tools truncate again on read.
+    const BODY_CAP = 8000;
+    const capBody = (b) => {
+      if (b == null) return null;
+      let s;
+      try {
+        if (typeof b === 'string') s = b;
+        else if (b instanceof URLSearchParams) s = b.toString();
+        else if (typeof FormData !== 'undefined' && b instanceof FormData) s = '[FormData]';
+        else if (typeof Blob !== 'undefined' && b instanceof Blob) s = '[Blob ' + b.size + ' bytes]';
+        else if (typeof ArrayBuffer !== 'undefined' && (b instanceof ArrayBuffer || ArrayBuffer.isView(b))) s = '[binary ' + (b.byteLength || 0) + ' bytes]';
+        else s = String(b);
+      } catch { s = '[unserializable body]'; }
+      return s.length > BODY_CAP ? s.slice(0, BODY_CAP) + '…[truncated]' : s;
+    };
     const push = (entry) => {
       window.__mcp.network.push(entry);
       if (window.__mcp.network.length > 500) window.__mcp.network.shift();
@@ -340,13 +356,21 @@ export const INSTRUMENTATION_SCRIPT = `
     window.fetch = async function(...args) {
       const url = typeof args[0] === 'string' ? args[0] : args[0].url;
       const method = (args[1] && args[1].method) || (args[0] && args[0].method) || 'GET';
-      const entry = { ts: Date.now(), kind: 'fetch', method, url: String(url), status: null, ms: null, error: null };
+      const reqBody = capBody((args[1] && args[1].body) != null ? args[1].body : null);
+      const entry = { ts: Date.now(), kind: 'fetch', method, url: String(url), status: null, ms: null, error: null, opaque: false, req_body: reqBody, resp_body: null };
       const t0 = performance.now();
       push(entry);
       try {
         const res = await origFetch.apply(this, args);
         entry.status = res.status;
+        // no-cors responses are opaque: status is forced to 0 by the platform.
+        entry.opaque = res.type === 'opaque' || res.type === 'opaqueredirect';
         entry.ms = Math.round(performance.now() - t0);
+        // Read the body off a clone so the caller's stream is untouched. Opaque
+        // responses expose no body, so skip them.
+        if (!entry.opaque) {
+          try { entry.resp_body = capBody(await res.clone().text()); } catch {}
+        }
         return res;
       } catch (e) {
         entry.error = (e && e.message) || String(e);
@@ -362,12 +386,20 @@ export const INSTRUMENTATION_SCRIPT = `
       return origOpen.call(this, method, url, ...rest);
     };
     XMLHttpRequest.prototype.send = function(...args) {
-      const entry = { ts: Date.now(), kind: 'xhr', method: this.__mcp?.method || 'GET', url: this.__mcp?.url || '', status: null, ms: null, error: null };
+      const entry = { ts: Date.now(), kind: 'xhr', method: this.__mcp?.method || 'GET', url: this.__mcp?.url || '', status: null, ms: null, error: null, opaque: false, req_body: capBody(args[0] != null ? args[0] : null), resp_body: null };
       const t0 = performance.now();
       push(entry);
       this.addEventListener('loadend', () => {
         entry.status = this.status;
         entry.ms = Math.round(performance.now() - t0);
+        // A 0 status with no transport error means the response was opaque
+        // (cross-origin without CORS) — surface that distinctly so a real
+        // failure isn't confused with a blocked-but-successful request.
+        if (this.status === 0 && !entry.error) entry.opaque = true;
+        try {
+          // responseText throws for non-text responseTypes (arraybuffer/blob).
+          if (!this.responseType || this.responseType === 'text') entry.resp_body = capBody(this.responseText);
+        } catch {}
       });
       this.addEventListener('error', () => { entry.error = 'xhr error'; });
       return origSend.apply(this, args);
