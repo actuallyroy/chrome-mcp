@@ -18,6 +18,17 @@ import {
 } from "./flows.js";
 import { resolveElementId, type LocatorArgs } from "./locators.js";
 import { outline } from "./outline.js";
+import {
+  currentScreenKey,
+  findNode,
+  findRoute,
+  getMap,
+  listApps,
+  removeEdgesManual,
+  renderMap,
+  setEdgeManual,
+  setNodeManual,
+} from "./pagemap.js";
 import { readLogcat } from "./logcat.js";
 import {
   getRecentCalls,
@@ -1044,7 +1055,7 @@ export const tools: Tool[] = [
         }));
       }
       const r = await fileFeedback({
-        message, severity, product: "android", version: "0.2.0", context, endpoint,
+        message, severity, product: "android", version: "0.3.0", context, endpoint,
       });
       const via = r.authored_by === "user" ? "via your gh CLI" : "via shared bot (install gh + auth to file as yourself)";
       return text(`filed issue #${r.issue_number} ${via} — ${r.url}`);
@@ -1165,6 +1176,78 @@ export const tools: Tool[] = [
       savedFlowNames.delete(name);
       emitToolsChanged();
       return text(`deleted flow "${name}"`);
+    },
+  },
+  {
+    name: "page_map",
+    description:
+      "Read AND curate the screen-navigation map for an app — a directed graph the MCP builds passively as you drive the device. " +
+      "Screens are identified by a stable signature of their UI (Android has no URL). Edges record how a screen was reached (tool + locator) and carry a `scope`: " +
+      "`global` edges (from \"*\") are reachable from ANY screen (persistent chrome: bottom nav / drawer / tabs, auto-detected by whether the tapped element survives the navigation); " +
+      "`local` edges are screen-specific. Observed edges are what I actually walked — not claims about the shortest path.\n" +
+      "Read actions: `print` (readable text diagram), `get` (raw graph JSON), `route` (best path from the current screen to one matching `target`), `apps` (list known apps).\n" +
+      "Write actions: `set_edge` (assert a link; defaults to global), `remove_edge` (drop an edge to a `to` screen), `set_node` (override a screen's role / attach a note).",
+    schema: z.object({
+      action: z.enum(["print", "get", "route", "apps", "set_edge", "remove_edge", "set_node"]).default("print"),
+      app: z.string().optional().describe("Package name. Defaults to the foreground app."),
+      target: z.string().optional().describe("For route: substring matched against screen key/title."),
+      to: z.string().optional().describe("For set_edge/remove_edge: destination screen key."),
+      from: z.string().optional().describe("For set_edge/remove_edge: source screen key. Omit for a global edge."),
+      key: z.string().optional().describe("For set_node: the screen key to annotate."),
+      locator: z.record(z.unknown()).optional().describe("For set_edge: how to trigger the link, e.g. { text: \"Orders\" } or { id: \"nav_orders\" }."),
+      scope: z.enum(["global", "local"]).optional(),
+      role: z.string().optional(),
+      note: z.string().optional(),
+    }),
+    handler: async (args) => {
+      const a = args as {
+        action: "print" | "get" | "route" | "apps" | "set_edge" | "remove_edge" | "set_node";
+        app?: string; target?: string; to?: string; from?: string; key?: string;
+        locator?: Record<string, unknown>; scope?: "global" | "local"; role?: string; note?: string;
+      };
+      if (a.action === "apps") return json({ apps: listApps() });
+
+      let useApp = a.app;
+      if (!useApp) {
+        try { useApp = (await currentApp())?.package; } catch { /* none */ }
+      }
+      if (!useApp) return text("No app: open an app first, or pass `app`. Known apps: " + (listApps().join(", ") || "(none yet)"));
+
+      if (a.action === "set_edge") {
+        if (!a.to) return { content: [{ type: "text", text: "set_edge requires `to`" }], isError: true };
+        return json({ ok: true, set: setEdgeManual({ app: useApp, to: a.to, from: a.from, locator: a.locator, scope: a.scope, note: a.note }) });
+      }
+      if (a.action === "remove_edge") {
+        if (!a.to) return { content: [{ type: "text", text: "remove_edge requires `to`" }], isError: true };
+        return json({ ok: true, removed: removeEdgesManual({ app: useApp, to: a.to, from: a.from }) });
+      }
+      if (a.action === "set_node") {
+        if (!a.key) return { content: [{ type: "text", text: "set_node requires `key`" }], isError: true };
+        const node = setNodeManual({ app: useApp, key: a.key, role: a.role, note: a.note });
+        if (!node) return { content: [{ type: "text", text: `No screen with key "${a.key}".` }], isError: true };
+        return json({ ok: true, node });
+      }
+      if (a.action === "route") {
+        if (!a.target) return { content: [{ type: "text", text: "route requires `target`" }], isError: true };
+        const from = currentScreenKey();
+        if (!from) return text("route needs a current screen — drive the app a bit first so the map knows where you are.");
+        const path = findRoute(useApp, from, a.target);
+        if (path) {
+          const allGlobal = path.every((e) => e.scope === "global");
+          return json({
+            app: useApp, from, target: a.target, via: allGlobal ? "global" : "ui",
+            ...(path.length > 1 ? { note: "Observed path — not necessarily the shortest. A global shortcut may exist; add one with set_edge." } : {}),
+            steps: path.map((e) => ({ from: e.from, to: e.to, tool: e.via.tool, locator: e.via.locator, scope: e.scope })),
+          });
+        }
+        const node = findNode(useApp, a.target);
+        if (node) return json({ app: useApp, from, target: a.target, via: "none", note: "Screen known but no learned route from here.", screen: { key: node.key, title: node.title } });
+        return text(`No route to a screen matching "${a.target}", and no such screen mapped yet.`);
+      }
+      if (a.action === "print") return text(renderMap(useApp));
+
+      const map = getMap(useApp);
+      return json(map);
     },
   },
 ];

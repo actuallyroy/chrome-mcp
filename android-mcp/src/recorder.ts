@@ -38,7 +38,7 @@ const META_TOOLS = new Set(["start_recording", "stop_recording", "recording_stat
 const READ_ONLY_TOOLS = new Set([
   "outline", "describe", "screenshot",
   "device_info", "current_app", "list_devices",
-  "get_logcat",
+  "get_logcat", "page_map",
   "sqlite_check", "sqlite_list_databases", "sqlite_list_packages",
   "sqlite_list_tables", "sqlite_table_schema", "sqlite_query", "sqlite_pull_db",
 ]);

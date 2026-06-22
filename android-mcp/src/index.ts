@@ -9,7 +9,8 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 import { tools, setNotifyToolsChanged, loadSavedFlows } from "./tools.js";
 import { recordCall } from "./recorder.js";
 import { dismissDevOverlay } from "./uiautomator2.js";
-import { fingerprint } from "./outline.js";
+import { screenState, locatorInTree } from "./outline.js";
+import { recordTransition, cleanLocator, flush as flushPageMap } from "./pagemap.js";
 
 // Tools that skip auto-dismiss: the dismiss itself (would recurse), and the
 // "pure read / non-interactive" tools where speed matters more than overlay
@@ -46,6 +47,7 @@ const SKIP_AUTO_DISMISS = new Set<string>([
   "list_flows",
   "delete_flow",
   "send_feedback",
+  "page_map",
 ]);
 
 // Track consecutive non-batched tool calls. When the agent runs a streak of
@@ -131,8 +133,8 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   try {
     const args = tool.schema.parse(rawArgs);
     const before = INTERACTIVE_TOOLS.has(tool.name)
-      ? await fingerprint().catch(() => "")
-      : "";
+      ? await screenState().catch(() => null)
+      : null;
     const result = await tool.handler(args as Record<string, unknown>);
     if (INTERACTIVE_TOOLS.has(tool.name)) {
       // Dev overlays spawned by this action can still block the next call.
@@ -140,18 +142,28 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       // Sample twice with a gap — animated bottom-sheet / modal transitions
       // can take ~200-400ms. If either sample differs from before, it changed.
       await new Promise((r) => setTimeout(r, 200));
-      let after = await fingerprint().catch(() => "");
-      if (before && after === before) {
+      let after = await screenState().catch(() => null);
+      if (before?.fp && after?.fp === before.fp) {
         await new Promise((r) => setTimeout(r, 250));
-        after = await fingerprint().catch(() => "");
+        after = await screenState().catch(() => null);
       }
-      if (before && after) {
-        const changed = before !== after;
-        const navHint =
-          !changed && NAV_EXPECTED.has(tool.name)
+      if (before?.fp && after?.fp) {
+        // Distinguish a real navigation (the screen identity changed) from an
+        // in-place content update (same screen, layout/tab/data changed) — a tap
+        // that only swaps a tab shouldn't read as "navigated".
+        const navigated = !!(before.sig && after.sig && before.sig.key !== after.sig.key);
+        const contentChanged = before.fp !== after.fp;
+        let note: string;
+        if (navigated) {
+          note = `[screen_changed: true]`;
+        } else if (contentChanged) {
+          note = `[screen_changed: false — same screen, content updated (tab/filter/expand), no navigation]`;
+        } else {
+          const navHint = NAV_EXPECTED.has(tool.name)
             ? " — expected navigation did not happen (modal, root screen, or blocked?)"
             : "";
-        const note = `[screen_changed: ${changed}]${navHint}`;
+          note = `[screen_changed: false]${navHint}`;
+        }
         const firstText = result.content.find((c) => c.type === "text");
         if (firstText && typeof firstText.text === "string") {
           firstText.text = `${firstText.text}\n${note}`;
@@ -159,6 +171,17 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
           result.content.push({ type: "text", text: note });
         }
       }
+      // Passively learn the app's screen graph. A tapped element that survives
+      // onto the new screen is persistent chrome (bottom nav) => a global link.
+      try {
+        const locator = cleanLocator(args);
+        // Global = persistent chrome (bottom nav/drawer). Only a resource-id
+        // match counts: a text/desc match false-positives when the destination
+        // shows the same label as its title (e.g. tapping "Sales Order" lands on
+        // a screen titled "Sales Order").
+        const persisted = typeof locator?.id === "string" && locatorInTree(after?.root ?? null, { id: locator.id });
+        recordTransition({ tool: tool.name, args, ok: !result.isError, before: before?.sig ?? null, after: after?.sig ?? null, persisted });
+      } catch { /* never let map capture break a tool call */ }
       // A LogBox badge spawned by this action often renders only after the
       // screen settles — later than the eager dismiss above. Without a second
       // pass it survives into the user's next screenshot/assert (which skip
@@ -212,6 +235,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   }
 });
+
+// Flush pending page-map writes on shutdown.
+for (const sig of ["exit", "SIGINT", "SIGTERM"] as const) {
+  process.on(sig, () => {
+    try { flushPageMap(); } catch { /* ignore */ }
+    if (sig !== "exit") process.exit(0);
+  });
+}
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

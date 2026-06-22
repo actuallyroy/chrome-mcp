@@ -181,13 +181,118 @@ export function getTree(): Promise<Node | null> {
   return dumpSource().then(parseXml);
 }
 
+// --- Screen signature (page-map identity) -------------------------------
+
+function fnv1a(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193); }
+  return (h >>> 0).toString(16);
+}
+
+function shortId(id: string): string {
+  const i = id.indexOf(":id/");
+  return i >= 0 ? id.slice(i + 4) : id;
+}
+
+export type ScreenSig = {
+  app: string;
+  activity?: string;
+  key: string;
+  title?: string;
+  landmarks: { list?: boolean; inputs?: number };
+};
+
+// A *stable* screen identity that survives dynamic content (list rows, data): we
+// key on the deduped SET of structural identifiers (resource-ids, content-descs,
+// classes), not their per-instance values — so a list with 3 vs 30 rows hashes
+// the same, while a genuinely different screen (different ids/labels) differs.
+export function signatureFromTree(root: Node | null): ScreenSig | null {
+  if (!root) return null;
+  const app = root.attrs.package || root.children[0]?.attrs.package || "";
+  if (!app) return null;
+  const ids = new Set<string>();
+  const descs = new Set<string>();
+  const classes = new Set<string>();
+  let inputs = 0;
+  let list = false;
+  let title: string | undefined;
+  let bestTitleY = Infinity;
+
+  const yOf = (bounds?: string): number => {
+    const m = bounds && bounds.match(/\[(\d+),(\d+)\]\[(\d+),(\d+)\]/);
+    return m ? Number(m[2]) : Infinity;
+  };
+  // Normalize volatile counts/ids so "Activities (18)" and "Activities (3)"
+  // collapse to one stable token — otherwise a screen re-keys every time a
+  // badge count changes and the same screen maps as many nodes.
+  const norm = (s: string) => s.replace(/\d+/g, "#").trim();
+  function walk(n: Node) {
+    const a = n.attrs;
+    if (a["resource-id"]) ids.add(norm(shortId(a["resource-id"])));
+    if (a["content-desc"]) descs.add(norm(a["content-desc"]));
+    if (a.class) classes.add(shortClass(a.class));
+    const cls = a.class || "";
+    if (/EditText/.test(cls)) inputs++;
+    if (a.scrollable === "true" || /RecyclerView|ListView/.test(cls)) list = true;
+    // Title heuristic: the topmost short TextView text.
+    if (cls.endsWith("TextView") && a.text) {
+      const t = a.text.trim();
+      const y = yOf(a.bounds);
+      if (t.length >= 2 && t.length <= 40 && y < bestTitleY) { bestTitleY = y; title = t; }
+    }
+    for (const c of n.children) walk(c);
+  }
+  walk(root);
+
+  const sortedIds = [...ids].sort();
+  const sortedDescs = [...descs].sort();
+  const sortedClasses = [...classes].sort();
+  // Screen identity should track the navigation destination, NOT in-screen
+  // content state (a tab/filter/expander swap changes the data but stays the
+  // same screen). The title is the best proxy for "which screen"; resource-ids
+  // pin the screen's chrome. Content-descs are deliberately EXCLUDED from the
+  // key — they carry the swappable content (tile labels, row data) and would
+  // re-key the screen on every tab toggle. Descs are only a last-resort basis
+  // when a screen exposes neither a title nor ids.
+  const titlePart = title ? norm(title) : "";
+  const basis = titlePart || sortedIds.length
+    ? [titlePart, "::", ...sortedIds]
+    : (sortedDescs.length ? sortedDescs : sortedClasses);
+  const key = fnv1a(`${app}\n${basis.join("|")}`);
+  return { app, activity: undefined, key, title, landmarks: { list, inputs } };
+}
+
+export async function screenSignature(): Promise<ScreenSig | null> {
+  const xml = await dumpSource().catch(() => "");
+  if (!xml) return null;
+  return signatureFromTree(parseXml(xml));
+}
+
+// Does an element matching `locator` (by resource-id / content-desc / text)
+// exist anywhere in the tree? Used for the persistence test: a tapped element
+// that survives onto the destination screen is global chrome (bottom nav etc.).
+export function locatorInTree(root: Node | null, locator: Record<string, unknown> | undefined): boolean {
+  if (!root || !locator) return false;
+  const wantId = typeof locator.id === "string" ? locator.id : undefined;
+  const wantDesc = typeof locator.desc === "string" ? locator.desc : undefined;
+  const wantText = typeof locator.text === "string" ? locator.text : undefined;
+  let found = false;
+  function walk(n: Node) {
+    if (found) return;
+    const a = n.attrs;
+    if (wantId && a["resource-id"] && (a["resource-id"] === wantId || shortId(a["resource-id"]) === shortId(wantId))) found = true;
+    else if (wantDesc && a["content-desc"] === wantDesc) found = true;
+    else if (wantText && a.text === wantText) found = true;
+    for (const c of n.children) if (!found) walk(c);
+  }
+  walk(root);
+  return found;
+}
+
 // Cheap screen fingerprint — captures package + activity + structural shape
 // (class names and bounds of every element). Changes when navigation, modal,
 // or any meaningful re-render happens.
-export async function fingerprint(): Promise<string> {
-  const xml = await dumpSource().catch(() => "");
-  if (!xml) return "";
-  const root = parseXml(xml);
+export function fingerprintFromTree(root: Node | null): string {
   if (!root) return "";
   const parts: string[] = [];
   const pkg = root.attrs.package || root.children[0]?.attrs.package || "";
@@ -199,12 +304,19 @@ export async function fingerprint(): Promise<string> {
     for (const c of n.children) walk(c);
   }
   walk(root);
-  const joined = parts.join("|");
-  // Light hash: FNV-1a 32-bit is enough for equality testing.
-  let h = 0x811c9dc5;
-  for (let i = 0; i < joined.length; i++) {
-    h ^= joined.charCodeAt(i);
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0).toString(16);
+  return fnv1a(parts.join("|"));
+}
+
+export async function fingerprint(): Promise<string> {
+  const xml = await dumpSource().catch(() => "");
+  if (!xml) return "";
+  return fingerprintFromTree(parseXml(xml));
+}
+
+// One UI dump → the change-detection fingerprint, the stable page-map signature,
+// and the parsed tree (for the persistence test). Avoids re-dumping per concern.
+export async function screenState(): Promise<{ fp: string; sig: ScreenSig | null; root: Node | null }> {
+  const xml = await dumpSource().catch(() => "");
+  const root = xml ? parseXml(xml) : null;
+  return { fp: fingerprintFromTree(root), sig: signatureFromTree(root), root };
 }
