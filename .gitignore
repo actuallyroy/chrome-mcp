@@ -55,3 +55,4 @@ windows-mcp/csharp-helper/obj/
 # Local test flows / recordings (not shipped)
 recordings/
 tsconfig.tsbuildinfo
+pagemaps/

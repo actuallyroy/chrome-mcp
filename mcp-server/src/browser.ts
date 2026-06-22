@@ -247,10 +247,15 @@ async function attachInstrumentation(page: Page) {
 }
 
 export async function ensureInstrumentation(page: Page) {
-  const installed = await page
-    .evaluate("typeof window.__mcp !== 'undefined' && window.__mcp.__installed === true")
+  // Re-inject when __mcp is missing OR is an older build lacking a capability
+  // we now depend on (here: the navigation log). Re-evaluating the script is
+  // idempotent and lets already-open tabs pick up upgrades without a reload.
+  const ready = await page
+    .evaluate(
+      "typeof window.__mcp !== 'undefined' && window.__mcp.__installed === true && window.__mcp._navInstalled === true",
+    )
     .catch(() => false);
-  if (!installed) {
+  if (!ready) {
     await page.evaluate(INSTRUMENTATION_SCRIPT);
   }
 }
@@ -312,6 +317,13 @@ export async function listPages(): Promise<Page[]> {
     const url = p.url();
     return !url.startsWith("devtools://") && !url.startsWith("chrome-extension://");
   });
+}
+
+// Non-launching accessor: returns the current active page only if one is
+// already open. Used by passive observers (e.g. the page-map capture hook) that
+// must never trigger a browser launch or tab claim as a side effect.
+export function getActivePageIfReady(): Page | null {
+  return activePage && !activePage.isClosed() ? activePage : null;
 }
 
 export async function getActivePage(): Promise<Page> {

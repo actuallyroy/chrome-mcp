@@ -8,6 +8,8 @@ import {
 import { zodToJsonSchema } from "zod-to-json-schema";
 import { tools } from "./tools.js";
 import { recordCall } from "./recorder.js";
+import { recordTransition, flush as flushPageMap } from "./pagemap.js";
+import { getActivePageIfReady } from "./browser.js";
 
 const server = new Server(
   { name: "chrome-mcp", version: "0.1.0" },
@@ -71,6 +73,16 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     appendTiming(result, Date.now() - __t0);
     const preview = result.content.find((c) => c.type === "text")?.text;
     recordCall(tool.name, args, !result.isError, preview);
+    // Passively learn the app's navigation graph (per-origin). Best-effort; the
+    // handler's own page is already settled by the time it returns.
+    try {
+      await recordTransition({
+        tool: tool.name,
+        args,
+        ok: !result.isError,
+        page: getActivePageIfReady(),
+      });
+    } catch { /* never let map capture break a tool call */ }
     if (result.isError) {
       const firstText = result.content.find((c) => c.type === "text");
       if (firstText && typeof firstText.text === "string") {
@@ -105,6 +117,14 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   }
 });
+
+// Flush any pending page-map writes on shutdown so the last navigations persist.
+for (const sig of ["exit", "SIGINT", "SIGTERM"] as const) {
+  process.on(sig, () => {
+    try { flushPageMap(); } catch { /* ignore */ }
+    if (sig !== "exit") process.exit(0);
+  });
+}
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

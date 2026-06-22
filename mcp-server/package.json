@@ -1,6 +1,6 @@
 {
   "name": "chrome-mcp",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "MCP server that drives your real Chrome browser over CDP",
   "type": "module",
   "bin": {

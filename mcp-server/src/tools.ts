@@ -75,6 +75,16 @@ import {
   startRecording,
   stopRecording,
 } from "./recorder.js";
+import {
+  findNode,
+  findRoute,
+  getMap,
+  listOrigins,
+  removeEdgesManual,
+  renderMap,
+  setEdgeManual,
+  setNodeManual,
+} from "./pagemap.js";
 
 export type ToolResult = {
   content: { type: "text" | "image"; text?: string; data?: string; mimeType?: string }[];
@@ -688,6 +698,16 @@ export const tools: Tool[] = [
         };
         const h = await resolveLocatorRetrying(p, loc);
         await h.evaluate((el) => (el as HTMLElement).scrollIntoView({ block: "center", behavior: "instant" as ScrollBehavior }));
+        // Tag the element so the page-map can later tell whether it survived the
+        // navigation (persistent chrome = global nav link) and, if the resulting
+        // navigation is harvested by a later read-only call, still attribute it to
+        // THIS click's locator. The marker lives on window, surviving SPA routes.
+        const clickLoc: Record<string, string> = {};
+        for (const k of ["text", "label", "selector"] as const) if (loc[k]) clickLoc[k] = loc[k] as string;
+        await h.evaluate((el, locator) => {
+          const w = window as unknown as { __mcp?: { __lastClicked?: Element; __lastClickedTs?: number; __lastClickedLoc?: unknown } };
+          if (w.__mcp) { w.__mcp.__lastClicked = el; w.__mcp.__lastClickedTs = Date.now(); w.__mcp.__lastClickedLoc = locator; }
+        }, clickLoc).catch(() => { /* best-effort */ });
         const watermark = Date.now();
         // Arm the dialog handler for whatever the click triggers. Default is
         // already "accept", so we only re-arm explicitly when the agent wants
@@ -1638,10 +1658,112 @@ export const tools: Tool[] = [
         }));
       }
       const r = await fileFeedback({
-        message, severity, product: "chrome", version: "0.3.0", context, endpoint,
+        message, severity, product: "chrome", version: "0.4.0", context, endpoint,
       });
       const via = r.authored_by === "user" ? "via your gh CLI" : "via shared bot (install gh + auth to file as yourself)";
       return { content: [{ type: "text", text: `filed issue #${r.issue_number} ${via} — ${r.url}` }] };
+    },
+  },
+  {
+    name: "page_map",
+    description:
+      "Read AND curate the navigation map for a site — a directed graph the MCP builds passively as you drive the browser. " +
+      "Nodes are pages (by path) with title/heading/role/landmarks. Edges record how a page was reached (tool + locator) and carry a `scope`: " +
+      "`global` edges (from \"*\") are reachable from ANY page (persistent sidebar/header chrome, auto-detected by whether the clicked element survives the navigation); " +
+      "`local` edges are page-specific. Observed edges are what I actually walked — they are not claims about the SHORTEST path, so a global one-hop may exist even when I took a long route.\n" +
+      "Read actions: `print` (readable text diagram), `get` (raw graph JSON), `route` (best path from the current page to a page matching `target` — prefers a global shortcut, else BFS, else a direct navigate), `origins`.\n" +
+      "Write actions (curate the map): `set_edge` (assert a link you know — defaults to global/reachable-from-anywhere; pass `from` for a local edge), `remove_edge` (drop a wrong/misleading edge to a `to` page), `set_node` (override a page's `role` or attach a `note`).",
+    schema: z.object({
+      action: z.enum(["print", "get", "route", "origins", "set_edge", "remove_edge", "set_node"]).default("print"),
+      origin: z.string().optional().describe("Override the origin (e.g. https://app.example.com). Defaults to the active tab's origin."),
+      target: z.string().optional().describe("For action=route: substring matched against page path/title/heading to find the destination."),
+      to: z.string().optional().describe("For set_edge/remove_edge: destination page path (e.g. /administration/location-management/locations)."),
+      from: z.string().optional().describe("For set_edge/remove_edge: source page path. Omit for a global (reachable-from-anywhere) edge."),
+      path: z.string().optional().describe("For set_node: the page path to annotate."),
+      locator: z.record(z.unknown()).optional().describe("For set_edge: how to trigger the link, e.g. { text: \"Locations\" } or { selector: \"...\" }."),
+      scope: z.enum(["global", "local"]).optional().describe("For set_edge: override scope. Defaults to global when `from` is omitted, else local."),
+      role: z.string().optional().describe("For set_node: override the inferred role."),
+      note: z.string().optional().describe("For set_edge/set_node: free-text annotation."),
+    }),
+    handler: async (args) => {
+      const a = args as {
+        action: "print" | "get" | "route" | "origins" | "set_edge" | "remove_edge" | "set_node";
+        origin?: string; target?: string; to?: string; from?: string; path?: string;
+        locator?: Record<string, unknown>; scope?: "global" | "local"; role?: string; note?: string;
+      };
+      if (a.action === "origins") return json({ origins: listOrigins() });
+
+      // Resolve origin + current path from the active tab unless overridden.
+      let useOrigin = a.origin;
+      let curKey: string | null = null;
+      if (!useOrigin || a.action === "route") {
+        try {
+          const u = new URL((await getActivePage()).url());
+          if (!useOrigin) useOrigin = u.origin;
+          curKey = u.pathname.replace(/\/+$/, "") || "/";
+        } catch { /* no active page */ }
+      }
+      if (!useOrigin) {
+        return text("No origin: open a tab first, or pass `origin`. Known sites: " + (listOrigins().join(", ") || "(none yet)"));
+      }
+
+      if (a.action === "set_edge") {
+        if (!a.to) return { content: [{ type: "text", text: "set_edge requires `to`" }], isError: true };
+        const edge = setEdgeManual({ origin: useOrigin, to: a.to, from: a.from, locator: a.locator, scope: a.scope, note: a.note });
+        return json({ ok: true, set: edge });
+      }
+      if (a.action === "remove_edge") {
+        if (!a.to) return { content: [{ type: "text", text: "remove_edge requires `to`" }], isError: true };
+        const removed = removeEdgesManual({ origin: useOrigin, to: a.to, from: a.from });
+        return json({ ok: true, removed });
+      }
+      if (a.action === "set_node") {
+        if (!a.path) return { content: [{ type: "text", text: "set_node requires `path`" }], isError: true };
+        const node = setNodeManual({ origin: useOrigin, path: a.path, role: a.role, note: a.note });
+        if (!node) return { content: [{ type: "text", text: `No node with path "${a.path}" in the map.` }], isError: true };
+        return json({ ok: true, node });
+      }
+
+      if (a.action === "route") {
+        if (!a.target) return { content: [{ type: "text", text: "route requires `target`" }], isError: true };
+        if (!curKey) return { content: [{ type: "text", text: "route needs an active tab to start from" }], isError: true };
+        const path = findRoute(useOrigin, curKey, a.target);
+        if (path) {
+          const allGlobal = path.every((e) => e.scope === "global");
+          const observed = path.some((e) => e.source === "observed");
+          return json({
+            origin: useOrigin, from: curKey, target: a.target,
+            via: allGlobal ? "global" : "ui",
+            ...(path.length > 1 && observed
+              ? { note: "Observed path — this is a route I walked, not necessarily the shortest. A direct/global link may exist; add one with set_edge if you find it." }
+              : {}),
+            steps: path.map((e) => ({ from: e.from, to: e.to, tool: e.via.tool, locator: e.via.locator, scope: e.scope })),
+          });
+        }
+        const node = findNode(useOrigin, a.target);
+        if (node) {
+          return json({
+            origin: useOrigin, from: curKey, target: a.target, via: "direct",
+            note: "No UI click-path learned yet; navigate directly to the page's URL.",
+            steps: [{ to: node.key, tool: "navigate", locator: { url: node.url } }],
+          });
+        }
+        return text(`No known route to a page matching "${a.target}", and no such page in the map yet. Navigate there once and it'll be learned.`);
+      }
+
+      if (a.action === "print") {
+        return text(renderMap(useOrigin));
+      }
+
+      // action === "get": summarize the graph compactly.
+      const map = getMap(useOrigin);
+      const nodes = Object.values(map.nodes)
+        .sort((x, y) => y.visits - x.visits)
+        .map((n) => ({ path: n.key, role: n.role, heading: n.heading, has_data: n.landmarks?.table ?? false, visits: n.visits, ...(n.note ? { note: n.note } : {}) }));
+      const edges = Object.values(map.edges).map((e) => ({
+        from: e.from, to: e.to, via: e.via.tool, locator: e.via.locator, scope: e.scope, source: e.source, count: e.count, ...(e.note ? { note: e.note } : {}),
+      }));
+      return json({ origin: useOrigin, updated_at: map.updated_at, node_count: nodes.length, edge_count: edges.length, nodes, edges });
     },
   },
 ];

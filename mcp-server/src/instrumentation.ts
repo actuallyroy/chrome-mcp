@@ -468,12 +468,51 @@ export const INSTRUMENTATION_SCRIPT = `
     window.__mcp._toastObs = obs;
   }
 
+  // Records every client-side route change (SPA pushState/replaceState/popstate)
+  // and the initial load, in order, with timestamps. The page-map harvests this
+  // ordered list so transitions are never missed regardless of when the server
+  // samples the URL — far more reliable than reading location.href at tool
+  // boundaries, which lags router commits.
+  function installNavCapture() {
+    if (window.__mcp._navInstalled) return;
+    window.__mcp.nav = [{ url: location.href, ts: Date.now() }];
+    const push = () => {
+      const url = location.href;
+      const arr = window.__mcp.nav;
+      const last = arr[arr.length - 1];
+      if (!last || last.url !== url) {
+        arr.push({ url, ts: Date.now() });
+        if (arr.length > 500) arr.shift();
+      }
+    };
+    // Fast path: patch the history API + listen for back/forward.
+    for (const m of ['pushState', 'replaceState']) {
+      const orig = history[m];
+      history[m] = function (...args) {
+        const r = orig.apply(this, args);
+        try { push(); } catch (e) { /* ignore */ }
+        return r;
+      };
+    }
+    window.addEventListener('popstate', push);
+    window.addEventListener('hashchange', push);
+    // Robust catch-all: poll location.href. Frameworks (Next.js App Router, etc.)
+    // often hold their own reference to history.pushState captured before this
+    // script ran, so the patch above can be bypassed; polling sees every URL
+    // change regardless of how it was triggered. 150ms is well under human
+    // navigation cadence and the cost is negligible.
+    setInterval(push, 150);
+    window.__mcp._navInstalled = true;
+  }
+
   window.__mcp = {
     __installed: true,
     toasts: [],
     console: [],
     network: [],
+    nav: [],
     paused: false,
+    installNavCapture,
     findByText,
     findAllByText,
     findByLabel,
@@ -489,8 +528,39 @@ export const INSTRUMENTATION_SCRIPT = `
   // Network and console need to be installed before any user code runs.
   installConsoleCapture();
   installNetworkCapture();
+  installNavCapture();
   // Toast watcher needs body to exist.
   if (document.body) installToastWatcher();
   else document.addEventListener('DOMContentLoaded', installToastWatcher, { once: true });
+})();
+
+// Idempotent upgrade: this runs UNCONDITIONALLY (outside the __installed gate)
+// every time the script is re-evaluated, so pages already carrying an older
+// __mcp — e.g. a tab that was open before the server was upgraded/reconnected —
+// gain the nav log without needing a fresh document.
+(() => {
+  if (!window.__mcp || window.__mcp._navInstalled) return;
+  if (!window.__mcp.nav) window.__mcp.nav = [{ url: location.href, ts: Date.now() }];
+  const push = () => {
+    const url = location.href;
+    const arr = window.__mcp.nav;
+    const last = arr[arr.length - 1];
+    if (!last || last.url !== url) {
+      arr.push({ url, ts: Date.now() });
+      if (arr.length > 500) arr.shift();
+    }
+  };
+  for (const m of ['pushState', 'replaceState']) {
+    const orig = history[m];
+    history[m] = function (...args) {
+      const r = orig.apply(this, args);
+      try { push(); } catch (e) { /* ignore */ }
+      return r;
+    };
+  }
+  window.addEventListener('popstate', push);
+  window.addEventListener('hashchange', push);
+  setInterval(push, 150);
+  window.__mcp._navInstalled = true;
 })();
 `;
