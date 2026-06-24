@@ -148,6 +148,10 @@ const Locator = {
   text: z.string().optional().describe("Exact visible text of the element (button/link/menu item)"),
   label: z.string().optional().describe("The form-field label text (for inputs, comboboxes, switches)"),
   selector: z.string().optional().describe("CSS selector escape hatch"),
+  within: z
+    .union([z.string(), z.number().int()])
+    .optional()
+    .describe("Scope a text/label lookup to a container — a CSS selector or an outline ref. Disambiguates duplicate matches (e.g. the Cancel inside a dialog vs. the page header)."),
 };
 
 type LocatorArgs = {
@@ -155,6 +159,7 @@ type LocatorArgs = {
   text?: string;
   label?: string;
   selector?: string;
+  within?: string | number;
 };
 
 type Candidate = { ref: number | null; role: string; text: string; aria_label?: string; exact: boolean };
@@ -188,35 +193,40 @@ async function resolveLocator(page: Page, loc: LocatorArgs): Promise<ElementHand
     if (h) return h;
     throw new Error(`No element matches selector: ${loc.selector}`);
   }
+  const within = loc.within ?? null;
+  const scopeNote = within != null ? ` within ${typeof within === "number" ? `ref=${within}` : `"${within}"`}` : "";
   if (loc.text) {
     // Pull the full candidate list so we can surface ambiguity when N>1.
     const candidates = await page.evaluate(
-      (t: string) => (window as unknown as { __mcp: { findAllByText(s: string): Candidate[] } }).__mcp.findAllByText(t),
+      (t: string, s: string | number | null) => (window as unknown as { __mcp: { findAllByText(s: string, scope?: string | number | null): Candidate[] } }).__mcp.findAllByText(t, s),
       loc.text,
+      within,
     );
     if (!candidates || candidates.length === 0) {
-      throw new Error(`No interactive element with text: "${loc.text}"`);
+      throw new Error(`No interactive element with text: "${loc.text}"${scopeNote}`);
     }
     if (candidates.length > 1) {
       lastAmbiguity = { locator_text: loc.text, candidates };
     }
     // Use the canonical findByText so picking semantics stay identical to before.
     const h = await page.evaluateHandle(
-      (t: string) => (window as unknown as { __mcp: { findByText(s: string): Element | null } }).__mcp.findByText(t),
+      (t: string, s: string | number | null) => (window as unknown as { __mcp: { findByText(s: string, roleHint?: string, scope?: string | number | null): Element | null } }).__mcp.findByText(t, undefined, s),
       loc.text,
+      within,
     );
     const el = h.asElement();
     if (el) return el as ElementHandle<Element>;
-    throw new Error(`No interactive element with text: "${loc.text}"`);
+    throw new Error(`No interactive element with text: "${loc.text}"${scopeNote}`);
   }
   if (loc.label) {
     const h = await page.evaluateHandle(
-      (t: string) => (window as unknown as { __mcp: { findByLabel(s: string): Element | null } }).__mcp.findByLabel(t),
+      (t: string, s: string | number | null) => (window as unknown as { __mcp: { findByLabel(s: string, scope?: string | number | null): Element | null } }).__mcp.findByLabel(t, s),
       loc.label,
+      within,
     );
     const el = h.asElement();
     if (el) return el as ElementHandle<Element>;
-    throw new Error(`No form field with label: "${loc.label}"`);
+    throw new Error(`No form field with label: "${loc.label}"${scopeNote}`);
   }
   throw new Error("Provide one of: ref, text, label, or selector.");
 }
@@ -1085,6 +1095,80 @@ export const tools: Tool[] = [
         return text(`At ${p.url()}`);
       }),
   },
+  {
+    name: "wait_for",
+    description:
+      "Poll until a condition becomes true, then return the settled value. Use this instead of guessing setTimeout delays after a click/fill — DOM and React state reads right after an action return the PRE-update value (issue #43). Provide exactly ONE of: " +
+      "`js` (a JS expression evaluated in the page; resolves when it returns truthy, and the value is returned), " +
+      "`selector` (resolves when it exists and is visible), or " +
+      "`text` (resolves when the substring appears in the page's visible text). " +
+      "Set `gone: true` to instead wait for the selector/text to DISAPPEAR (e.g. a spinner). " +
+      "Polls every `poll_ms` up to `timeout_ms`; errors on timeout.",
+    schema: z.object({
+      js: z.string().optional().describe("JS expression; truthy result ends the wait and is returned (e.g. \"document.querySelector('[data-x]')?.getAttribute('aria-checked')==='true'\")"),
+      selector: z.string().optional().describe("Wait until this selector exists and is visible"),
+      text: z.string().optional().describe("Wait until this substring is visible in the page text"),
+      gone: z.boolean().default(false).describe("Invert: wait for the selector/text to disappear (ignored for `js`)"),
+      timeout_ms: z.number().int().min(100).max(30_000).default(5000),
+      poll_ms: z.number().int().min(50).max(2000).default(150),
+    }),
+    handler: async (args) =>
+      withPage(async (p) => {
+        const { js, selector, text: needle, gone, timeout_ms, poll_ms } = args as {
+          js?: string; selector?: string; text?: string;
+          gone: boolean; timeout_ms: number; poll_ms: number;
+        };
+        if ([js, selector, needle].filter((v) => v != null).length !== 1) {
+          throw new Error("Provide exactly one of: js, selector, or text.");
+        }
+        const deadline = Date.now() + timeout_ms;
+        const started = Date.now();
+        // Returns { ok, value? }: ok means the wait is satisfied this tick.
+        const probe = async (): Promise<{ ok: boolean; value?: unknown }> => {
+          if (js != null) {
+            // Evaluate the expression in page scope; swallow ReferenceErrors etc.
+            // during the transient window before the target exists.
+            const value = await p
+              .evaluate((expr: string) => {
+                try { return (0, eval)(expr) as unknown; } catch { return undefined; }
+              }, js)
+              .catch(() => undefined);
+            return { ok: !!value, value };
+          }
+          if (selector != null) {
+            const found = await p
+              .evaluate((sel: string) => {
+                const el = document.querySelector(sel);
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                if (r.width === 0 && r.height === 0) return false;
+                const s = getComputedStyle(el);
+                return !(s.visibility === "hidden" || s.display === "none" || s.opacity === "0");
+              }, selector)
+              .catch(() => false);
+            return { ok: gone ? !found : found };
+          }
+          // text
+          const present = await p
+            .evaluate((t: string) => document.body.innerText.includes(t), needle as string)
+            .catch(() => false);
+          return { ok: gone ? !present : present };
+        };
+        for (;;) {
+          const r = await probe();
+          if (r.ok) {
+            const ms = Date.now() - started;
+            if (js != null) return json({ ok: true, waited_ms: ms, value: r.value });
+            return text(`condition met after ${ms}ms`);
+          }
+          if (Date.now() >= deadline) {
+            const what = js != null ? `js: ${js}` : selector != null ? `selector ${gone ? "still present" : "not visible"}: ${selector}` : `text ${gone ? "still present" : "not found"}: "${needle}"`;
+            throw new Error(`wait_for timed out after ${timeout_ms}ms — ${what}`);
+          }
+          await new Promise((r) => setTimeout(r, poll_ms));
+        }
+      }),
+  },
 
   // ---- Chrome lifecycle --------------------------------------------------
   {
@@ -1658,7 +1742,7 @@ export const tools: Tool[] = [
         }));
       }
       const r = await fileFeedback({
-        message, severity, product: "chrome", version: "0.4.0", context, endpoint,
+        message, severity, product: "chrome", version: "0.5.0", context, endpoint,
       });
       const via = r.authored_by === "user" ? "via your gh CLI" : "via shared bot (install gh + auth to file as yourself)";
       return { content: [{ type: "text", text: `filed issue #${r.issue_number} ${via} — ${r.url}` }] };

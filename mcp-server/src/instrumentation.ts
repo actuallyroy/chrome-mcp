@@ -21,6 +21,32 @@ export const INSTRUMENTATION_SCRIPT = `
     return true;
   }
 
+  // True when the element's box overlaps the current viewport. Used as a
+  // tiebreaker when several elements match the same text/label — the one the
+  // user can actually see is almost always the intended target (issue #45).
+  function inViewport(el) {
+    if (!el || !(el instanceof Element)) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) return false;
+    const vw = window.innerWidth || document.documentElement.clientWidth;
+    const vh = window.innerHeight || document.documentElement.clientHeight;
+    return r.bottom > 0 && r.right > 0 && r.top < vh && r.left < vw;
+  }
+
+  // Resolve a scope/container for a locator (issue #45): a CSS selector string
+  // or an outline ref number narrows the search to that element's subtree, so
+  // "the Cancel inside the dropdown" doesn't collide with a page-header Cancel.
+  // Returns document when no scope is given; null when a scope was requested but
+  // not found (so finders return no match rather than silently widening).
+  function resolveScope(scope) {
+    if (scope == null || scope === '') return document;
+    if (typeof scope === 'number') return document.querySelector('[data-mcp-ref="' + String(scope) + '"]');
+    if (typeof scope === 'string') {
+      try { return document.querySelector(scope); } catch (e) { return null; }
+    }
+    return document;
+  }
+
   function visibleText(el) {
     if (!el) return '';
     // Avoid getting concatenated text of huge subtrees
@@ -79,17 +105,18 @@ export const INSTRUMENTATION_SCRIPT = `
     return '';
   }
 
-  function interactiveElements() {
+  function interactiveElements(root) {
+    root = root || document;
     // Include all <a> (not just a[href]) — frameworks like Next.js Link often
     // render anchors without href and rely on onClick for client-side routing.
     const sel = 'a, button, input:not([type="hidden"]), textarea, select, [role="button"], [role="link"], [role="menuitem"], [role="option"], [role="tab"], [role="checkbox"], [role="radio"], [role="switch"], [role="combobox"], [role="textbox"], [role="searchbox"], [role="spinbutton"], [role="slider"]';
-    const explicit = [...document.querySelectorAll(sel)].filter(isVisible);
+    const explicit = [...root.querySelectorAll(sel)].filter(isVisible);
     // Also surface "card-style" clickables: divs/spans/etc with cursor:pointer
     // and a React onClick listener (no href, no role). Common in shadcn/Radix
     // wizards. We can't introspect React listeners, but cursor:pointer is the
     // styling tell — apps explicitly set it on click targets.
     const explicitSet = new Set(explicit);
-    const cursorPointer = [...document.querySelectorAll('div, span, li, article, section, label')].filter((el) => {
+    const cursorPointer = [...root.querySelectorAll('div, span, li, article, section, label')].filter((el) => {
       if (explicitSet.has(el)) return false;
       if (!isVisible(el)) return false;
       if (getComputedStyle(el).cursor !== 'pointer') return false;
@@ -102,9 +129,19 @@ export const INSTRUMENTATION_SCRIPT = `
     return [...explicit, ...cursorPointer];
   }
 
-  function findByText(text, roleHint) {
+  // Among equally-good matches, prefer one that's in the viewport (issue #45):
+  // duplicated/offscreen nodes (virtualized lists, hidden tab panes) routinely
+  // shadow the visible target. Falls back to the first match when none is in view.
+  function preferVisible(list) {
+    if (!list || !list.length) return null;
+    return list.find(inViewport) || list[0];
+  }
+
+  function findByText(text, roleHint, scope) {
     const target = text.trim();
-    const els = interactiveElements();
+    const root = resolveScope(scope);
+    if (!root) return null;
+    const els = interactiveElements(root);
     // Prefer exact visibleText matches
     const exact = els.filter(e => {
       const t = (e.innerText || e.textContent || '').trim();
@@ -112,20 +149,22 @@ export const INSTRUMENTATION_SCRIPT = `
     });
     if (roleHint) {
       const byRole = exact.filter(e => elRole(e) === roleHint);
-      if (byRole.length) return byRole[0];
+      if (byRole.length) return preferVisible(byRole);
     }
-    if (exact.length) return exact[0];
+    if (exact.length) return preferVisible(exact);
     // Contains match, still on interactive els only
     const partial = els.filter(e => (e.innerText || '').trim().includes(target));
-    return partial[0] || null;
+    return preferVisible(partial);
   }
 
   // Same matching rules as findByText, but returns ALL candidates with a
   // descriptor so the tool layer can warn about ambiguous matches (issue #17).
   // Order: exact matches first, then contains-matches in DOM order.
-  function findAllByText(text) {
+  function findAllByText(text, scope) {
     const target = text.trim();
-    const els = interactiveElements();
+    const root = resolveScope(scope);
+    if (!root) return [];
+    const els = interactiveElements(root);
     const exact = [];
     const partial = [];
     for (const e of els) {
@@ -134,7 +173,10 @@ export const INSTRUMENTATION_SCRIPT = `
       if (inner === target || aria === target) exact.push(e);
       else if (inner.includes(target)) partial.push(e);
     }
-    const ordered = [...exact, ...partial];
+    // Within each tier, float in-viewport matches first so the ambiguity report
+    // and the canonical pick agree on which element is "the visible one" (#45).
+    const vis = (arr) => [...arr.filter(inViewport), ...arr.filter(e => !inViewport(e))];
+    const ordered = [...vis(exact), ...vis(partial)];
     if (typeof window.__mcp.__nextRef !== 'number') window.__mcp.__nextRef = 1;
     return ordered.map(e => {
       // Stamp a ref if the element doesn't have one yet, so the ambiguity
@@ -156,10 +198,12 @@ export const INSTRUMENTATION_SCRIPT = `
     });
   }
 
-  function findByLabel(label) {
+  function findByLabel(label, scope) {
     const target = label.replace(/\\*/g,'').trim().toLowerCase();
+    const root = resolveScope(scope);
+    if (!root) return null;
     // Native <label for=>
-    for (const lbl of document.querySelectorAll('label')) {
+    for (const lbl of root.querySelectorAll('label')) {
       const t = lbl.textContent.replace(/\\*/g,'').trim().toLowerCase();
       if (t === target) {
         if (lbl.htmlFor) {
@@ -171,7 +215,7 @@ export const INSTRUMENTATION_SCRIPT = `
       }
     }
     // shadcn/radix: sibling or cousin input after a label-like element
-    const labelEls = [...document.querySelectorAll('label, [data-slot="label"], [role="label"]')];
+    const labelEls = [...root.querySelectorAll('label, [data-slot="label"], [role="label"]')];
     for (const lbl of labelEls) {
       const t = lbl.textContent.replace(/\\*/g,'').trim().toLowerCase();
       if (t !== target) continue;
@@ -185,12 +229,12 @@ export const INSTRUMENTATION_SCRIPT = `
       }
     }
     // aria-label fallback
-    for (const e of interactiveElements()) {
+    for (const e of interactiveElements(root)) {
       const al = (e.getAttribute('aria-label') || '').replace(/\\*/g,'').trim().toLowerCase();
       if (al === target) return e;
     }
     // placeholder fallback
-    for (const e of document.querySelectorAll('input, textarea')) {
+    for (const e of root.querySelectorAll('input, textarea')) {
       const ph = (e.placeholder || '').replace(/\\*/g,'').trim().toLowerCase();
       if (ph === target && isVisible(e)) return e;
     }
