@@ -320,6 +320,60 @@ export const INSTRUMENTATION_SCRIPT = `
     return lines.join('\\n');
   }
 
+  // True when a node looks like the actual click target — a native control, an
+  // ARIA widget, or a cursor:pointer/onClick container. Custom React widgets
+  // (Radix/shadcn rows, styled-div "checkboxes") put the handler on a wrapper,
+  // not on a semantic element, so the visible node you'd target is often NOT
+  // where the click belongs (issue #46).
+  function isClickTarget(el) {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = el.tagName;
+    if (tag === 'BUTTON' || (tag === 'A')) return true;
+    if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return true;
+    const role = el.getAttribute && el.getAttribute('role');
+    if (role && ['button','link','menuitem','option','tab','checkbox','radio','switch','combobox'].indexOf(role) >= 0) return true;
+    if (el.hasAttribute && el.hasAttribute('onclick')) return true;
+    try { if (getComputedStyle(el).cursor === 'pointer') return true; } catch (e) { /* detached */ }
+    return false;
+  }
+
+  // Walk self→ancestors and return the nearest node that is the real click
+  // target, so describe() can point the agent at what to actually click.
+  function clickableAncestor(el) {
+    let node = el, depth = 0;
+    while (node && node.nodeType === 1 && depth < 10) {
+      if (isClickTarget(node)) return node;
+      node = node.parentElement;
+      depth++;
+    }
+    return null;
+  }
+
+  // Read the current toggle/selected state however it's encoded — ARIA, Radix
+  // data-state, the native checked property, or the styling tell apps use when
+  // there's no semantic state at all (issue #46: a <div> with bg-primary + an
+  // inner check SVG). Returns { state, source } or null when not a stateful control.
+  function toggleState(el) {
+    if (!el || el.nodeType !== 1) return null;
+    const g = (n) => el.getAttribute && el.getAttribute(n);
+    if (g('aria-checked') != null) return { state: g('aria-checked'), source: 'aria-checked' };
+    if (g('aria-selected') != null) return { state: g('aria-selected'), source: 'aria-selected' };
+    if (g('aria-pressed') != null) return { state: g('aria-pressed'), source: 'aria-pressed' };
+    if (g('data-state') != null) return { state: g('data-state'), source: 'data-state' };
+    if ((el.tagName === 'INPUT') && (el.type === 'checkbox' || el.type === 'radio')) {
+      return { state: el.checked ? 'true' : 'false', source: 'checked' };
+    }
+    // No semantic state — fall back to the visual tell. shadcn marks a selected
+    // box with a primary background and renders a check SVG inside it.
+    const cls = (el.className && el.className.baseVal != null) ? el.className.baseVal : (typeof el.className === 'string' ? el.className : '');
+    const hasPrimaryBg = /\\bbg-primary\\b/.test(cls);
+    const hasCheckSvg = !!(el.querySelector && el.querySelector('svg'));
+    if (hasPrimaryBg || hasCheckSvg) {
+      return { state: (hasPrimaryBg && hasCheckSvg) ? 'true (inferred)' : 'maybe (inferred)', source: 'className/svg heuristic' };
+    }
+    return null;
+  }
+
   function describeElement(el) {
     if (!el) return null;
     const attrs = {};
@@ -338,6 +392,45 @@ export const INSTRUMENTATION_SCRIPT = `
       depth++;
     }
     const rect = el.getBoundingClientRect();
+
+    // Find the real click target and, if it isn't the element itself, stamp a
+    // ref on it so the agent can target it directly.
+    const target = clickableAncestor(el);
+    let clickTarget = null;
+    if (target) {
+      let tref = target.getAttribute('data-mcp-ref');
+      if (!tref) {
+        if (typeof window.__mcp.__nextRef !== 'number') window.__mcp.__nextRef = 1;
+        tref = String(window.__mcp.__nextRef++);
+        target.setAttribute('data-mcp-ref', tref);
+      }
+      clickTarget = {
+        is_self: target === el,
+        tag: target.tagName.toLowerCase(),
+        role: elRole(target),
+        ref: tref ? Number(tref) : null,
+        text: visibleText(target),
+      };
+    }
+
+    // State (toggle/selected) — check the element, then the click target, since
+    // the encoded state often lives on the wrapper, not the leaf.
+    const state = toggleState(el) || (target && target !== el ? toggleState(target) : null);
+
+    // Build a concrete recommendation the agent can act on. (String concat, not
+    // template literals — this whole file is itself a template-literal source.)
+    let recommend;
+    if (!target) {
+      recommend = 'Not an interactive element — no click target found in its ancestry.';
+    } else if (clickTarget.is_self) {
+      recommend = 'Click it directly: click({ ref: ' + clickTarget.ref + ' })' + (visibleText(el) ? ' or click({ text: "' + visibleText(el) + '" })' : '');
+    } else {
+      recommend = 'This element is not the click target — the handler is on an ancestor <' + clickTarget.tag + (clickTarget.role ? ' role=' + clickTarget.role : '') + '>. Click that instead: click({ ref: ' + clickTarget.ref + ' }).';
+    }
+    if (state) {
+      recommend += ' Current state: ' + state.state + ' (via ' + state.source + '); clicking toggles it.';
+    }
+
     return {
       tag: el.tagName.toLowerCase(),
       role: elRole(el),
@@ -348,6 +441,9 @@ export const INSTRUMENTATION_SCRIPT = `
       rect: { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) },
       attrs,
       ancestors: parents,
+      click_target: clickTarget,
+      state: state || undefined,
+      recommend,
     };
   }
 

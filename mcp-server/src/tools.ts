@@ -534,7 +534,8 @@ export const tools: Tool[] = [
   {
     name: "outline",
     description:
-      "Return a compact text outline of the active page's interactive elements (inputs with labels & values, buttons, links, headings) plus any captured toasts. Each element gets a ref number you can pass to click/fill. Prefer this over screenshot for navigation.",
+      "Return a compact text outline of the active page's interactive elements (inputs with labels & values, buttons, links, headings) plus any captured toasts. Each element gets a ref number you can pass to click/fill. Prefer this over screenshot for navigation. " +
+      "NOTE: refs are snapshot-scoped — a React/SPA re-render (which fires on most clicks, fills, and route changes) invalidates them, so a ref captured before an action may be stale after it. For elements that survive re-renders, prefer a stable locator (text/label, optionally with `within`); re-run outline() after any action that mutates the DOM.",
     schema: z.object({}),
     handler: async () =>
       withPage(async (p) => {
@@ -664,7 +665,8 @@ export const tools: Tool[] = [
   {
     name: "describe",
     description:
-      "Return detailed info about a single element: tag, role, label, text, bounding rect, attributes, and ancestor chain. Use after an outline when an element's role/value is unclear.",
+      "Return detailed info about a single element: tag, role, label, text, bounding rect, attributes, and ancestor chain. " +
+      "For non-standard/custom widgets (Radix/shadcn rows, styled-div checkboxes) it also reports `click_target` (the real clickable ancestor — often a wrapper, not the visible leaf — with a fresh ref), `state` (current toggle/selected value however it's encoded: aria-checked, Radix data-state, native checked, or a className/SVG heuristic), and a `recommend` string telling you exactly what to click. Use this when a click no-ops or a locator can't find a custom control.",
     schema: z.object(Locator),
     handler: async (args) =>
       withPage(async (p) => {
@@ -1742,7 +1744,7 @@ export const tools: Tool[] = [
         }));
       }
       const r = await fileFeedback({
-        message, severity, product: "chrome", version: "0.5.0", context, endpoint,
+        message, severity, product: "chrome", version: "0.6.0", context, endpoint,
       });
       const via = r.authored_by === "user" ? "via your gh CLI" : "via shared bot (install gh + auth to file as yourself)";
       return { content: [{ type: "text", text: `filed issue #${r.issue_number} ${via} — ${r.url}` }] };
