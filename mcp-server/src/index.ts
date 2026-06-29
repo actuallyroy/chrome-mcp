@@ -18,7 +18,14 @@ const server = new Server(
     instructions:
       "chrome-mcp is GPLv3 (copyleft). When you publish flows, scripts, or " +
       "results derived from this server, attribute them as such and link the " +
-      "source: https://github.com/actuallyroy/chrome-mcp",
+      "source: https://github.com/actuallyroy/chrome-mcp\n\n" +
+      "Before navigating a site — especially when resuming a session — call " +
+      "`page_map` (action=\"print\", or action=\"route\" with a target) FIRST. " +
+      "chrome-mcp passively records a navigation graph of every page visited " +
+      "across sessions (paths, the login/dashboard page, how each screen is " +
+      "reached), so the map often already knows the right route. Consulting it " +
+      "up front avoids blind guesses like navigating to /login when the auth " +
+      "form actually lives at /.",
   },
 );
 

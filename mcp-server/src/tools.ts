@@ -1772,7 +1772,7 @@ export const tools: Tool[] = [
         }));
       }
       const r = await fileFeedback({
-        message, severity, product: "chrome", version: "0.7.0", context, endpoint,
+        message, severity, product: "chrome", version: "0.7.1", context, endpoint,
       });
       const via = r.authored_by === "user" ? "via your gh CLI" : "via shared bot (install gh + auth to file as yourself)";
       return { content: [{ type: "text", text: `filed issue #${r.issue_number} ${via} — ${r.url}` }] };
@@ -1782,6 +1782,7 @@ export const tools: Tool[] = [
     name: "page_map",
     description:
       "Read AND curate the navigation map for a site — a directed graph the MCP builds passively as you drive the browser. " +
+      "CALL THIS FIRST when you start or resume work on a site, before navigating: the map persists across sessions and often already knows the route to a page (and where login lives), so `print`/`route` up front saves blind guessing. " +
       "Nodes are pages (by path) with title/heading/role/landmarks. Edges record how a page was reached (tool + locator) and carry a `scope`: " +
       "`global` edges (from \"*\") are reachable from ANY page (persistent sidebar/header chrome, auto-detected by whether the clicked element survives the navigation); " +
       "`local` edges are page-specific. Observed edges are what I actually walked — they are not claims about the SHORTEST path, so a global one-hop may exist even when I took a long route.\n" +
