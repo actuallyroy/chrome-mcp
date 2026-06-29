@@ -364,7 +364,9 @@ export const tools: Tool[] = [
   // ---- Interaction -------------------------------------------------------
   {
     name: "click",
-    description: "Tap an element. Locator: ref | text | desc | id | xpath | class | selector.",
+    description:
+      "Tap an element. Locator: ref | text | desc | id | xpath | class | selector. " +
+      "For a segmented OTP / passcode field (e.g. 6 boxes with id=otp-input), don't tap a box then type — a gesture tap may not focus an RN TextInput. Instead use `fill` on the FIRST box with the whole code; the digits fan out across the boxes in one call.",
     schema: z.object(Locator),
     handler: async (args) => {
       try {
@@ -1055,7 +1057,7 @@ export const tools: Tool[] = [
         }));
       }
       const r = await fileFeedback({
-        message, severity, product: "android", version: "0.4.0", context, endpoint,
+        message, severity, product: "android", version: "0.4.1", context, endpoint,
       });
       const via = r.authored_by === "user" ? "via your gh CLI" : "via shared bot (install gh + auth to file as yourself)";
       return text(`filed issue #${r.issue_number} ${via} — ${r.url}`);
