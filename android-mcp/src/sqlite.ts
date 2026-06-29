@@ -124,82 +124,104 @@ export async function accessModeFor(pkg: string): Promise<AccessMode> {
   return getState(pkg).access || "cd";
 }
 
-// Find a usable sqlite3 binary. Prefers an app-local copy (so run-as can exec
-// it directly), falling back to system paths.
+// Parse the leading "3.x.y" from `sqlite3 -version` output. Returns null when
+// it doesn't look like a sqlite3 version string.
+function parseSqliteVersion(out: string): { major: number; minor: number } | null {
+  const m = out.trim().match(/^(\d+)\.(\d+)/);
+  if (!m) return null;
+  return { major: Number(m[1]), minor: Number(m[2]) };
+}
+
+// `-json` output mode was added in SQLite 3.33.0 (2020-08-14). Older binaries
+// (the system sqlite3 is frequently 3.32.2) error on `-json`, forcing the
+// brittle `-header -separator` parse — so we prefer a binary that supports it.
+function supportsJson(v: { major: number; minor: number } | null): boolean {
+  if (!v) return false;
+  return v.major > 3 || (v.major === 3 && v.minor >= 33);
+}
+
+// Copy a sqlite3 binary (already on the device at `srcPath`) into the app
+// sandbox so run-as can exec it directly. Returns "./sqlite3" on success.
+async function copyIntoAppDir(pkg: string, srcPath: string): Promise<string | null> {
+  try {
+    await runAs(pkg, `cp ${srcPath} ./sqlite3`);
+    await runAs(pkg, "chmod 755 ./sqlite3");
+    const verify = (await runAs(pkg, "./sqlite3 -version")).trim();
+    if (parseSqliteVersion(verify)) return "./sqlite3";
+  } catch { /* copy/verify failed */ }
+  return null;
+}
+
+// Push the vendored modern arm64 sqlite3 to /data/local/tmp. Returns its
+// on-device path, or null if unavailable / wrong ABI.
+async function pushVendored(): Promise<string | null> {
+  const vendored = findVendoredSqlite3();
+  if (!vendored) return null;
+  try {
+    await adb(["push", vendored, "/data/local/tmp/sqlite3"], { timeout_ms: 30_000 });
+    await adbShell("chmod 755 /data/local/tmp/sqlite3");
+    const v = (await adbShell("/data/local/tmp/sqlite3 -version 2>&1")).trim();
+    // An ABI mismatch (x86 emulator) prints "... exec format error" / no version.
+    if (parseSqliteVersion(v)) return "/data/local/tmp/sqlite3";
+  } catch { /* push/exec failed (likely wrong ABI) */ }
+  return null;
+}
+
+// Find a usable sqlite3 binary and cache its path. Provisions one if the app
+// sandbox doesn't have it yet (issue #47): a freshly (re)installed app has no
+// `./sqlite3`, so we copy one in. We PREFER a binary that supports `-json` —
+// the vendored modern build over an old system sqlite3 — so structured output
+// keeps working instead of silently falling back to separator parsing.
 export async function ensureSqlite3(pkg: string): Promise<string> {
   const s = getState(pkg);
   if (s.sqlite3Path) return s.sqlite3Path;
 
-  // 1. App-local sqlite3
+  // 1. App-local sqlite3 that already supports -json — use as-is.
   try {
-    const v = await runAs(pkg, "./sqlite3 -version");
-    if (/^3\.\d+/.test(v.trim())) {
-      s.sqlite3Path = "./sqlite3";
-      return s.sqlite3Path;
-    }
-  } catch { /* not present */ }
+    const v = parseSqliteVersion(await runAs(pkg, "./sqlite3 -version"));
+    if (supportsJson(v)) { s.sqlite3Path = "./sqlite3"; return s.sqlite3Path; }
+  } catch { /* not present yet */ }
 
-  // 2. System paths — try to copy into app dir for run-as access; otherwise
-  //    use the system path directly (some run-as envs reject absolute exec).
-  const systemPaths = [
-    "/system/bin/sqlite3",
-    "/system/xbin/sqlite3",
-    "/data/local/tmp/sqlite3",
-  ];
+  // 2. Survey the system binaries and their versions (don't commit yet — we may
+  //    have a newer vendored build to prefer).
+  const systemPaths = ["/system/bin/sqlite3", "/system/xbin/sqlite3", "/data/local/tmp/sqlite3"];
+  let systemModern: string | null = null;   // a system binary that supports -json
+  let systemAny: string | null = null;      // any usable system binary (maybe old)
   for (const p of systemPaths) {
     try {
-      const v = (await adbShell(`${p} -version 2>&1`)).trim();
-      if (!/^3\.\d+/.test(v)) continue;
-      // Try to copy into app dir
-      try {
-        await runAs(pkg, `cp ${p} ./sqlite3`);
-        await runAs(pkg, "chmod 755 ./sqlite3");
-        const verify = (await runAs(pkg, "./sqlite3 -version")).trim();
-        if (/^3\.\d+/.test(verify)) {
-          s.sqlite3Path = "./sqlite3";
-          return s.sqlite3Path;
-        }
-      } catch { /* copy failed */ }
-      s.sqlite3Path = p;
-      return s.sqlite3Path;
+      const v = parseSqliteVersion(await adbShell(`${p} -version 2>&1`));
+      if (!v) continue;
+      if (!systemAny) systemAny = p;
+      if (supportsJson(v)) { systemModern = p; break; }
     } catch { /* not at this path */ }
   }
 
-  // 3. Push vendored arm64 binary to /data/local/tmp and use it from there.
-  const vendored = findVendoredSqlite3();
-  if (vendored) {
-    try {
-      await adb(["push", vendored, "/data/local/tmp/sqlite3"], { timeout_ms: 30_000 });
-      await adbShell("chmod 755 /data/local/tmp/sqlite3");
-      const v = (await adbShell("/data/local/tmp/sqlite3 -version 2>&1")).trim();
-      if (/^3\.\d+/.test(v)) {
-        // Try to copy into the app dir for run-as access; otherwise use tmp directly.
-        try {
-          await runAs(pkg, "cp /data/local/tmp/sqlite3 ./sqlite3");
-          await runAs(pkg, "chmod 755 ./sqlite3");
-          const verify = (await runAs(pkg, "./sqlite3 -version")).trim();
-          if (/^3\.\d+/.test(verify)) {
-            s.sqlite3Path = "./sqlite3";
-            return s.sqlite3Path;
-          }
-        } catch { /* run-as cp failed */ }
-        s.sqlite3Path = "/data/local/tmp/sqlite3";
-        return s.sqlite3Path;
-      }
-    } catch (e) {
-      const msg = (e as Error).message;
-      // Wrong arch (e.g. x86 emulator) — surface a clearer hint than "exec format error".
-      if (/exec format|Exec format/.test(msg)) {
-        throw new Error(
-          "Vendored sqlite3 is arm64; this device looks like a different ABI. " +
-            "Push a matching sqlite3 binary to /data/local/tmp/sqlite3 manually.",
-        );
-      }
-    }
+  // 3. Prefer a -json-capable binary: a modern system one, else the vendored
+  //    modern build. Provision into the app dir (run-as exec); fall back to the
+  //    on-device path when the in-sandbox copy isn't possible.
+  if (systemModern) {
+    s.sqlite3Path = (await copyIntoAppDir(pkg, systemModern)) || systemModern;
+    return s.sqlite3Path;
+  }
+  const vendoredPath = await pushVendored();
+  if (vendoredPath) {
+    s.sqlite3Path = (await copyIntoAppDir(pkg, vendoredPath)) || vendoredPath;
+    return s.sqlite3Path;
   }
 
+  // 4. Last resort: a system binary that works but is too old for -json (queries
+  //    fall back to -header -separator parsing automatically).
+  if (systemAny) {
+    s.sqlite3Path = (await copyIntoAppDir(pkg, systemAny)) || systemAny;
+    return s.sqlite3Path;
+  }
+  // ...or an already-present app-local binary too old for -json.
+  try {
+    if (parseSqliteVersion(await runAs(pkg, "./sqlite3 -version"))) { s.sqlite3Path = "./sqlite3"; return s.sqlite3Path; }
+  } catch { /* still nothing */ }
+
   throw new Error(
-    "sqlite3 not found on device and no vendored binary available. " +
+    "sqlite3 not found on device and no usable vendored binary (wrong ABI?). " +
       "Push one manually: adb push <sqlite3-binary> /data/local/tmp/sqlite3 && adb shell chmod 755 /data/local/tmp/sqlite3",
   );
 }

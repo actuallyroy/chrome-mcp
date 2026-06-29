@@ -1055,7 +1055,7 @@ export const tools: Tool[] = [
         }));
       }
       const r = await fileFeedback({
-        message, severity, product: "android", version: "0.3.0", context, endpoint,
+        message, severity, product: "android", version: "0.4.0", context, endpoint,
       });
       const via = r.authored_by === "user" ? "via your gh CLI" : "via shared bot (install gh + auth to file as yourself)";
       return text(`filed issue #${r.issue_number} ${via} — ${r.url}`);
