@@ -957,7 +957,8 @@ export const tools: Tool[] = [
   {
     name: "scroll",
     description:
-      "Scroll the page. Provide a locator (to scroll an element into view) or dx/dy (pixel delta).",
+      "Scroll the page. Provide a locator (to scroll an element into view) or dx/dy (pixel delta). " +
+      "A dx/dy scroll dispatches a real wheel event (via CDP) so pages with wheel listeners (scroll-jacking, carousels, lazy-loaders) observe it, then verifies the page actually moved and falls back to a programmatic scroll if not.",
     schema: z.object({
       ...Locator,
       dx: z.number().default(0),
@@ -971,8 +972,35 @@ export const tools: Tool[] = [
           await h.evaluate((el) => (el as HTMLElement).scrollIntoView({ block: "center", behavior: "instant" as ScrollBehavior }));
           return text("scrolled into view");
         }
-        await p.evaluate((x, y) => window.scrollBy(x, y), a.dx, a.dy);
-        return text(`scrolled by (${a.dx}, ${a.dy})`);
+        const before = await p.evaluate(() => ({ x: window.scrollX, y: window.scrollY }));
+        // Dispatch a *real* wheel event through CDP so the page can observe it
+        // (a programmatic window.scrollBy fires `scroll` but never `wheel`, so
+        // wheel-driven UIs silently no-op — issue #49). The mouse is positioned
+        // over the viewport centre so the event lands on the scrollable root.
+        let usedWheel = false;
+        try {
+          const vp = await p.evaluate(() => ({ w: window.innerWidth, h: window.innerHeight }));
+          await p.mouse.move(Math.round(vp.w / 2), Math.round(vp.h / 2));
+          await p.mouse.wheel({ deltaX: a.dx, deltaY: a.dy });
+          usedWheel = true;
+        } catch { /* fall through to programmatic scroll */ }
+        // Let the scroll settle before reading position: wheel scrolling is
+        // applied on the compositor (and pages with scroll-behavior:smooth
+        // animate over several frames), so scrollY doesn't update on the same
+        // tick — reading synchronously would spuriously look like "no movement"
+        // and trigger a needless fallback.
+        await new Promise((r) => setTimeout(r, 120));
+        const after = await p.evaluate(() => ({ x: window.scrollX, y: window.scrollY }));
+        const moved = after.x !== before.x || after.y !== before.y;
+        // If the wheel genuinely did nothing (or threw), fall back to the
+        // reliable programmatic scroll so the call still works.
+        if (!moved && (a.dx !== 0 || a.dy !== 0)) {
+          await p.evaluate((x, y) => window.scrollBy(x, y), a.dx, a.dy);
+          await new Promise((r) => setTimeout(r, 120));
+          const final = await p.evaluate(() => ({ x: window.scrollX, y: window.scrollY }));
+          return text(`scrolled by (${a.dx}, ${a.dy}) [wheel had no effect — used programmatic fallback; now at y=${Math.round(final.y)}]`);
+        }
+        return text(`scrolled by (${a.dx}, ${a.dy}) [${usedWheel ? "real wheel event" : "programmatic"}; now at y=${Math.round(after.y)}]`);
       }),
   },
 
@@ -1744,7 +1772,7 @@ export const tools: Tool[] = [
         }));
       }
       const r = await fileFeedback({
-        message, severity, product: "chrome", version: "0.6.0", context, endpoint,
+        message, severity, product: "chrome", version: "0.7.0", context, endpoint,
       });
       const via = r.authored_by === "user" ? "via your gh CLI" : "via shared bot (install gh + auth to file as yourself)";
       return { content: [{ type: "text", text: `filed issue #${r.issue_number} ${via} — ${r.url}` }] };

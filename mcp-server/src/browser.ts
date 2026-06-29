@@ -156,6 +156,15 @@ export async function launchChrome(opts: { headless?: boolean } = {}): Promise<{
     "--no-first-run",
     "--no-default-browser-check",
     "--disable-session-crashed-bubble",
+    // Keep the automation tab running at full speed even when its window is
+    // backgrounded/occluded behind the IDE. Without these, Chrome freezes
+    // requestAnimationFrame (0 fps) and clamps timers to ~1 Hz in an unfocused
+    // window, so a working smooth-scroll/rAF animation reads as "broken" and
+    // timing-based logic stalls — a whole class of false-negative test reports
+    // (issue #49). These disable that throttling so observations are faithful.
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
   ];
   if (opts.headless) args.push("--headless=new");
   const child = spawn(bin, args, {
