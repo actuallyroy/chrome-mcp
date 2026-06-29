@@ -9,6 +9,7 @@ import {
   acquireLock,
   formatOwner,
   installCleanup,
+  listFreshLocks,
   releaseLock,
   setHeartbeatTarget,
   verifyLock,
@@ -360,21 +361,82 @@ export async function getActivePage(): Promise<Page> {
     await claimPage(activePage);
     return activePage;
   }
-  // Prefer the focused tab, then the first un-locked tab, then page[0].
-  let focused: Page | null = null;
-  for (const p of pages) {
-    try {
-      if (await p.evaluate(() => document.hasFocus())) {
-        focused = p;
-        break;
-      }
-    } catch { /* page may have navigated/closed — skip */ }
+  // The previous active tab is gone and we must auto-rebind. The danger in a
+  // shared profile: another session's `bringToFront` makes THEIR tab the
+  // focused one, so blindly picking the focused tab would silently rebind us
+  // onto someone else's tab and act on it (issue #44). So we classify every
+  // candidate by lock owner and only auto-bind to a tab that's safe: one we
+  // already own, or one nobody actively holds. We never silently take a tab
+  // an OTHER active session holds — that requires an explicit select_tab/take_tab.
+  const locks = listFreshLocks();
+  const classified = await Promise.all(
+    pages.map(async (p) => {
+      let owner: ReturnType<typeof ownerSummary> = null;
+      try {
+        const tid = await targetIdFor(p);
+        owner = ownerSummary(locks[`${DEFAULT_PORT}:${tid}`]);
+      } catch { /* page closed mid-scan */ }
+      let focused = false;
+      try { focused = await p.evaluate(() => document.hasFocus()); } catch { /* skip */ }
+      return { page: p, owner, focused };
+    }),
+  );
+  const mine = classified.filter((c) => c.owner?.mine);
+  const free = classified.filter((c) => !c.owner);
+  // Prefer a tab we already own (focused first), then a free tab (focused first).
+  const pick =
+    mine.find((c) => c.focused)?.page || mine[0]?.page ||
+    free.find((c) => c.focused)?.page || free[0]?.page;
+  if (!pick) {
+    const owners = classified
+      .map((c) => (c.owner && !c.owner.mine ? formatOwner(c.owner.lock) : null))
+      .filter((v): v is string => !!v);
+    throw new Error(
+      `The active tab was lost and every open tab is owned by another chrome-mcp session ` +
+        `(${owners.join("; ") || "unknown"}). Pick one explicitly with select_tab (and force/force_break_active ` +
+        `if you've coordinated with the user), or open a fresh tab with new_tab.`,
+    );
   }
-  const candidate = focused || pages[0];
-  activePage = candidate;
+  activePage = pick;
   await ensureInstrumentation(activePage);
   await claimPage(activePage);
   return activePage;
+}
+
+// Summarize a lock entry for ownership checks. Returns null when there's no
+// (fresh) lock on the target.
+function ownerSummary(lock: { session_id: string } | undefined):
+  | { mine: boolean; lock: Parameters<typeof formatOwner>[0] }
+  | null {
+  if (!lock) return null;
+  return { mine: lock.session_id === SESSION_ID, lock: lock as Parameters<typeof formatOwner>[0] };
+}
+
+// Who owns the currently-bound active tab? Powers the `get_active_tab` /
+// whoami tool so an agent can assert before acting (issue #44). Read-only —
+// never launches Chrome or claims a tab.
+export async function whoamiActiveTab(): Promise<{
+  session_id: string;
+  has_active_tab: boolean;
+  url?: string;
+  title?: string;
+  owner?: string | null;
+  mine?: boolean;
+}> {
+  const page = getActivePageIfReady();
+  if (!page || !activeTargetId) {
+    return { session_id: SESSION_ID, has_active_tab: false };
+  }
+  const locks = listFreshLocks();
+  const summary = ownerSummary(locks[`${DEFAULT_PORT}:${activeTargetId}`]);
+  return {
+    session_id: SESSION_ID,
+    has_active_tab: true,
+    url: page.url(),
+    title: await page.title().catch(() => ""),
+    owner: summary ? formatOwner(summary.lock) : null,
+    mine: summary ? summary.mine : false,
+  };
 }
 
 export async function selectPageByIndex(index: number, force: boolean | "break_active" = false): Promise<Page> {

@@ -63,6 +63,7 @@ import {
   selectPageByIndex,
   selectPageByUrlSubstring,
   setActivePage,
+  whoamiActiveTab,
 } from "./browser.js";
 import { formatOwner, listFreshLocks } from "./tab-lock.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -1245,6 +1246,14 @@ export const tools: Tool[] = [
     },
   },
   {
+    name: "get_active_tab",
+    description:
+      "Report the tab this session is currently bound to and whether THIS session owns it — a whoami for tab ownership. " +
+      "Returns { session_id, has_active_tab, url, title, owner, mine }. When sharing one Chrome across sessions, call this to assert you're still on your own tab before acting; `mine:false` means another session owns the active tab (use select_tab/take_tab to claim one). Read-only: never launches Chrome or claims a tab.",
+    schema: z.object({}),
+    handler: async () => json(await whoamiActiveTab()),
+  },
+  {
     name: "select_tab",
     description:
       "Make a tab active. Provide index (from list_tabs) or url_contains (substring). " +
@@ -1772,7 +1781,7 @@ export const tools: Tool[] = [
         }));
       }
       const r = await fileFeedback({
-        message, severity, product: "chrome", version: "0.7.1", context, endpoint,
+        message, severity, product: "chrome", version: "0.8.0", context, endpoint,
       });
       const via = r.authored_by === "user" ? "via your gh CLI" : "via shared bot (install gh + auth to file as yourself)";
       return { content: [{ type: "text", text: `filed issue #${r.issue_number} ${via} — ${r.url}` }] };

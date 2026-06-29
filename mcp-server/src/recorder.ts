@@ -36,7 +36,7 @@ const READ_ONLY_TOOLS = new Set([
   "outline", "describe", "screenshot", "snapshot",
   "get_text", "get_html", "get_url", "get_title", "get_attribute",
   "get_toasts", "get_console", "get_network", "get_cookies",
-  "list_tabs",
+  "list_tabs", "get_active_tab",
 ]);
 
 // Tools that mutate / act but still don't belong in a replayable flow:
