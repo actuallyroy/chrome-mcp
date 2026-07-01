@@ -53,7 +53,7 @@ const SKIP_AUTO_DISMISS = new Set<string>([
 // Track consecutive non-batched tool calls. When the agent runs a streak of
 // individual calls, nudge them toward `run_script` inline batching — at most
 // once per session, since repeated hints just burn tokens (issue #28).
-const BATCH_NUDGE_THRESHOLD = 10;
+const BATCH_NUDGE_THRESHOLD = 20;
 let consecutiveSingleCalls = 0;
 let batchNudgeShown = false;
 const BATCH_NUDGE = `\n\n[hint] You've made ${BATCH_NUDGE_THRESHOLD}+ tool calls in a row. When you're confident about the next 2-3 steps, batch them with \`run_script { script: { steps: [{tool, args}, ...] } }\` to save round-trips. It stops at the first failure and the report tells you which step \`i\` to resume at.`;

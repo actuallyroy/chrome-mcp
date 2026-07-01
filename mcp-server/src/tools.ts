@@ -2,10 +2,10 @@ import { PNG } from "pngjs";
 import { z } from "zod";
 import type { ElementHandle, Page } from "puppeteer-core";
 
-function resizePngBase64(b64: string, maxDim: number): string {
+function resizePngBase64(b64: string, maxDim: number): { b64: string; width: number; height: number } {
   const src = PNG.sync.read(Buffer.from(b64, "base64"));
   const longest = Math.max(src.width, src.height);
-  if (longest <= maxDim) return b64;
+  if (longest <= maxDim) return { b64, width: src.width, height: src.height };
   const scale = maxDim / longest;
   const dw = Math.max(1, Math.round(src.width * scale));
   const dh = Math.max(1, Math.round(src.height * scale));
@@ -22,7 +22,7 @@ function resizePngBase64(b64: string, maxDim: number): string {
       dst.data[di + 3] = src.data[si + 3];
     }
   }
-  return PNG.sync.write(dst).toString("base64");
+  return { b64: PNG.sync.write(dst).toString("base64"), width: dw, height: dh };
 }
 
 // Build a ToolResult from raw screenshot bytes: optionally write the
@@ -39,8 +39,19 @@ function finalizeScreenshot(
     saved_bytes = buf.length;
   }
   if (opts.return_inline) {
-    const b64 = resizePngBase64(Buffer.from(buf).toString("base64"), opts.max_dim);
+    const { b64, width, height } = resizePngBase64(Buffer.from(buf).toString("base64"), opts.max_dim);
     content.push({ type: "image", data: b64, mimeType: "image/png" });
+    // Surface the token cost so agents self-regulate: an inline image is re-read
+    // from cache on EVERY subsequent turn, so a big capture compounds over a long
+    // session (issue #50). Claude bills images at ~(w*h)/750 tokens.
+    const tokens = Math.round((width * height) / 750);
+    content.push({
+      type: "text",
+      text:
+        `inline PNG ${width}x${height} ≈ ${tokens} image tokens — persists in context and is re-billed every following turn. ` +
+        `To cut cost: use \`outline\` for structure/text; \`selector\`/\`clip\` to grab just the region you need; a smaller \`max_dim\`; ` +
+        `or \`return_inline:false\` + \`save_path\` to archive without paying the per-turn image cost.`,
+    });
   }
   if (opts.save_path) {
     content.push({ type: "text", text: `wrote ${saved_bytes} bytes to ${opts.save_path}` });
@@ -1398,12 +1409,13 @@ export const tools: Tool[] = [
     name: "screenshot",
     description:
       "Take a PNG screenshot of the active tab. By default returns inline (downscaled to fit MCP's 2000px image cap). " +
+      "COST: an inline image is re-read from cache on every following turn, so large/full-page captures compound token cost over a long session (issue #50). Prefer `outline` for structure/text; use `selector`/`clip` to capture only the region you need; lower `max_dim` for a cheaper image; or `return_inline:false` + `save_path` to archive to disk without paying the per-turn image cost. The result reports the image's token estimate. " +
       "Pass `save_path` to also write the *original* (un-downscaled) PNG to disk — required for archiving captures into manuals, regression baselines, or any task where the inline preview's resolution is too low. " +
-      "Use `clip` to capture a region or `selector` to auto-clip to a DOM element's bounding box. " +
+      "`max_dim` caps the inline image's longest side (default 1600; full-page defaults to a cheaper 1000 since it's the biggest token hog). " +
       "Prefer `outline` for navigation and element lookup; use `screenshot` for visual verification, layout bugs, canvas/charts/media.",
     schema: z.object({
       full_page: z.boolean().default(false),
-      max_dim: z.number().int().min(256).max(2000).default(1600),
+      max_dim: z.number().int().min(256).max(2000).optional().describe("Cap the inline image's longest side in px. Default 1600, or 1000 for full_page. Lower = fewer tokens."),
       save_path: z.string().optional().describe("Absolute path on the host to write the full-resolution PNG to. When set, the file is written even if return_inline=false."),
       return_inline: z.boolean().default(true).describe("Include the (downscaled) PNG in the tool result. Set false when archiving so you don't pay the inline-image overhead."),
       clip: z.object({
@@ -1414,7 +1426,7 @@ export const tools: Tool[] = [
     handler: async (args) =>
       withPage(async (p) => {
         const { full_page, max_dim, save_path, return_inline, clip, selector } = args as {
-          full_page: boolean; max_dim: number;
+          full_page: boolean; max_dim?: number;
           save_path?: string; return_inline: boolean;
           clip?: { x: number; y: number; width: number; height: number };
           selector?: string;
@@ -1422,6 +1434,10 @@ export const tools: Tool[] = [
         // Mutual exclusion sanity check.
         const modes = [full_page, !!clip, !!selector].filter(Boolean).length;
         if (modes > 1) throw new Error("screenshot: full_page, clip, and selector are mutually exclusive — pick one.");
+        // Full-page captures are the biggest token hog and persist per-turn, so
+        // when the caller didn't pin a size, default them smaller than viewport
+        // shots (issue #50).
+        const effMaxDim = max_dim ?? (full_page ? 1000 : 1600);
 
         let opts: Parameters<typeof p.screenshot>[0] = { fullPage: full_page, type: "png" };
         if (clip) opts = { type: "png", clip };
@@ -1429,10 +1445,10 @@ export const tools: Tool[] = [
           const el = await p.$(selector);
           if (!el) throw new Error(`screenshot: selector "${selector}" matched no element`);
           const buf = (await el.screenshot({ type: "png" })) as Uint8Array;
-          return finalizeScreenshot(buf, { save_path, return_inline, max_dim });
+          return finalizeScreenshot(buf, { save_path, return_inline, max_dim: effMaxDim });
         }
         const buf = (await p.screenshot(opts)) as Uint8Array;
-        return finalizeScreenshot(buf, { save_path, return_inline, max_dim });
+        return finalizeScreenshot(buf, { save_path, return_inline, max_dim: effMaxDim });
       }),
   },
   {
@@ -1781,7 +1797,7 @@ export const tools: Tool[] = [
         }));
       }
       const r = await fileFeedback({
-        message, severity, product: "chrome", version: "0.8.0", context, endpoint,
+        message, severity, product: "chrome", version: "0.9.0", context, endpoint,
       });
       const via = r.authored_by === "user" ? "via your gh CLI" : "via shared bot (install gh + auth to file as yourself)";
       return { content: [{ type: "text", text: `filed issue #${r.issue_number} ${via} — ${r.url}` }] };

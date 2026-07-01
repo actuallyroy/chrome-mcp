@@ -29,10 +29,16 @@ const server = new Server(
   },
 );
 
-const BATCH_NUDGE_THRESHOLD = 10;
-const BATCH_NUDGE_COOLDOWN = 15;
+// Nudge the agent toward run_script batching only when it's clearly hand-rolling
+// a long streak of single calls — and sparingly. A too-frequent hint just burns
+// tokens and reads as nagging, so we require a longer streak, a longer cooldown
+// between hints, and cap the total per session (the agent has learned by then).
+const BATCH_NUDGE_THRESHOLD = 20;
+const BATCH_NUDGE_COOLDOWN = 60;
+const BATCH_NUDGE_MAX = 3;
 let consecutiveSingleCalls = 0;
 let callsSinceLastNudge = Infinity;
+let batchNudgesShown = 0;
 const BATCH_NUDGE = `\n\n[hint] You've made ${BATCH_NUDGE_THRESHOLD}+ tool calls in a row. When you're confident about the next 2-3 steps, batch them with \`run_script { script: { steps: [{tool, args}, ...] } }\` to save round-trips. It stops at the first failure and the report tells you which step \`i\` to resume at.`;
 
 function appendTiming(result: { content: Array<{ type: string; text?: string }>; isError?: boolean }, ms: number) {
@@ -103,7 +109,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     } else {
       consecutiveSingleCalls++;
       callsSinceLastNudge++;
-      if (consecutiveSingleCalls >= BATCH_NUDGE_THRESHOLD && callsSinceLastNudge >= BATCH_NUDGE_COOLDOWN) {
+      if (
+        batchNudgesShown < BATCH_NUDGE_MAX &&
+        consecutiveSingleCalls >= BATCH_NUDGE_THRESHOLD &&
+        callsSinceLastNudge >= BATCH_NUDGE_COOLDOWN
+      ) {
         const firstText = result.content.find((c) => c.type === "text");
         if (firstText && typeof firstText.text === "string") {
           firstText.text = firstText.text + BATCH_NUDGE;
@@ -112,6 +122,7 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
         }
         callsSinceLastNudge = 0;
         consecutiveSingleCalls = 0;
+        batchNudgesShown++;
       }
     }
     return result;
