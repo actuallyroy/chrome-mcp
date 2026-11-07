@@ -18,12 +18,57 @@ import {
 const DEFAULT_PORT = Number(process.env.CHROME_DEBUG_PORT ?? 9222);
 const DEFAULT_HOST = process.env.CHROME_DEBUG_HOST ?? "127.0.0.1";
 
+// Issue #54: a single frozen renderer (page stuck in a `while(true)`, "Page
+// Unresponsive") or a tab paused at a DevTools breakpoint used to wedge EVERY
+// tool call. `browser.pages()` attaches to all page targets and the attach
+// handshake (Network.enable etc.) never gets answered by a frozen/paused
+// renderer; puppeteer's default protocolTimeout is 180s, longer than most MCP
+// clients wait, so the agent saw an infinite hang. We now (a) bound every CDP
+// command with a short protocolTimeout, (b) attach to targets in parallel with
+// a per-target deadline and remember the ones that didn't answer so they're
+// skipped instead of re-stalling every call, and (c) expose a page-free health
+// probe (`ping`).
+const PROTOCOL_TIMEOUT_MS = Number(process.env.CHROME_MCP_PROTOCOL_TIMEOUT_MS ?? 30_000);
+const ATTACH_TIMEOUT_MS = Number(process.env.CHROME_MCP_ATTACH_TIMEOUT_MS ?? 5_000);
+// How long an unresponsive target stays blacklisted before we try it again.
+const UNRESPONSIVE_RETRY_MS = 60_000;
+
 let browser: Browser | null = null;
 let activePage: Page | null = null;
 let activeTargetId: string | null = null;
+const startedAt = Date.now();
 
 export function getCdpPort(): number {
   return DEFAULT_PORT;
+}
+
+export class TimeoutError extends Error {
+  constructor(label: string, ms: number) {
+    super(`${label} did not complete within ${ms}ms`);
+    this.name = "TimeoutError";
+  }
+}
+
+export function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  let timer: NodeJS.Timeout;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new TimeoutError(label, ms)), ms);
+  });
+  return Promise.race([p, deadline]).finally(() => clearTimeout(timer)) as Promise<T>;
+}
+
+// Targets that failed to answer the attach handshake, keyed by target URL +
+// the time we gave up. Surfaced by `ping` / `list_tabs` so the agent can tell
+// "one tab is frozen" from "the server is wedged".
+type Unresponsive = { url: string; since: number; reason: string };
+const unresponsive = new Map<string, Unresponsive>();
+
+export function getUnresponsiveTabs(): Unresponsive[] {
+  return [...unresponsive.values()];
+}
+
+function isAutomatableUrl(url: string): boolean {
+  return !url.startsWith("devtools://") && !url.startsWith("chrome-extension://");
 }
 
 const targetIdCache = new WeakMap<Page, string>();
@@ -248,8 +293,11 @@ export function armNextDialog(page: Page, action: "accept" | "dismiss", text?: s
 
 async function attachInstrumentation(page: Page) {
   // Re-install on every new document so refs/toast watcher survive navigations.
+  // Bounded: a renderer paused at a DevTools breakpoint never answers
+  // Page.addScriptToEvaluateOnNewDocument (issue #54); ensureInstrumentation
+  // re-injects per call anyway, so giving up here costs nothing.
   try {
-    await page.evaluateOnNewDocument(INSTRUMENTATION_SCRIPT);
+    await withTimeout(page.evaluateOnNewDocument(INSTRUMENTATION_SCRIPT), ATTACH_TIMEOUT_MS, "evaluateOnNewDocument");
   } catch {
     // some CDP targets don't support this; fall back to per-call injection
   }
@@ -260,14 +308,40 @@ export async function ensureInstrumentation(page: Page) {
   // Re-inject when __mcp is missing OR is an older build lacking a capability
   // we now depend on (here: the navigation log). Re-evaluating the script is
   // idempotent and lets already-open tabs pick up upgrades without a reload.
-  const ready = await page
-    .evaluate(
-      "typeof window.__mcp !== 'undefined' && window.__mcp.__installed === true && window.__mcp._navInstalled === true",
-    )
-    .catch(() => false);
-  if (!ready) {
-    await page.evaluate(INSTRUMENTATION_SCRIPT);
+  // Both evaluates are bounded: a renderer paused at a DevTools breakpoint (or
+  // spinning in a tight loop) never answers Runtime.evaluate, and without a
+  // bound each one sat for the full protocolTimeout, back to back (issue #54).
+  const url = page.url();
+  const unresponsiveError = () => {
+    unresponsive.set(url, { url, since: Date.now(), reason: `Runtime.evaluate did not answer within ${ATTACH_TIMEOUT_MS}ms` });
+    return new Error(
+      `Tab ${url} is not responding to CDP — the renderer is frozen ("Page Unresponsive") or paused at a DevTools breakpoint. ` +
+        `Resume the debugger / reload or close that tab, or move to another with select_tab / new_tab. ` +
+        `\`ping\` lists the tabs currently skipped as unresponsive.`,
+    );
+  };
+  let ready = false;
+  try {
+    ready = (await withTimeout(
+      page.evaluate(
+        "typeof window.__mcp !== 'undefined' && window.__mcp.__installed === true && window.__mcp._navInstalled === true",
+      ),
+      ATTACH_TIMEOUT_MS,
+      "instrumentation probe",
+    )) as boolean;
+  } catch (err) {
+    if (err instanceof TimeoutError) throw unresponsiveError();
+    ready = false;
   }
+  if (!ready) {
+    try {
+      await withTimeout(page.evaluate(INSTRUMENTATION_SCRIPT), ATTACH_TIMEOUT_MS, "instrumentation inject");
+    } catch (err) {
+      if (err instanceof TimeoutError) throw unresponsiveError();
+      throw err;
+    }
+  }
+  unresponsive.delete(url);
 }
 
 export async function getBrowser(): Promise<Browser> {
@@ -275,8 +349,17 @@ export async function getBrowser(): Promise<Browser> {
 
   const browserURL = `http://${DEFAULT_HOST}:${DEFAULT_PORT}`;
   const autoSpawn = !/^(1|true|yes)$/i.test(process.env.CHROME_MCP_NO_AUTOSPAWN || "");
+  // Skip DevTools frontends and extension pages at the connect layer so we
+  // never attach to them, and bound every CDP command so a stuck renderer
+  // surfaces as an error instead of an infinite hang (issue #54).
+  const connectOpts = {
+    browserURL,
+    defaultViewport: null,
+    protocolTimeout: PROTOCOL_TIMEOUT_MS,
+    targetFilter: (t: { url(): string }) => isAutomatableUrl(t.url()),
+  };
   try {
-    browser = await puppeteer.connect({ browserURL, defaultViewport: null });
+    browser = await puppeteer.connect(connectOpts);
   } catch (firstErr) {
     if (!autoSpawn) {
       throw new Error(
@@ -289,7 +372,7 @@ export async function getBrowser(): Promise<Browser> {
       // eslint-disable-next-line no-console
       console.error("[chrome-mcp] debug port not up — spawning Chrome…");
       await launchChrome();
-      browser = await puppeteer.connect({ browserURL, defaultViewport: null });
+      browser = await puppeteer.connect(connectOpts);
     } catch (err) {
       throw new Error(
         `Auto-launch failed. ${(err as Error).message}\n` +
@@ -308,25 +391,86 @@ export async function getBrowser(): Promise<Browser> {
   });
   browser.on("targetcreated", async (target) => {
     try {
-      const p = await target.page();
+      const p = await withTimeout(target.page(), ATTACH_TIMEOUT_MS, "attach new target");
       if (p) await attachInstrumentation(p);
     } catch {
       // ignore
     }
   });
-  for (const p of await browser.pages()) {
-    await attachInstrumentation(p);
-  }
+  // Attach in parallel with a per-target deadline; one stuck tab must not
+  // block connecting to the rest (issue #54).
+  const pages = await collectPages(browser);
+  await Promise.allSettled(pages.map((p) => attachInstrumentation(p)));
   return browser;
+}
+
+// `browser.pages()` is Promise.all over `target.page()` for every page target,
+// so one frozen renderer stalls the whole list for protocolTimeout — on every
+// call. This version races each attach against ATTACH_TIMEOUT_MS, drops the
+// ones that don't answer, and remembers them so later calls skip them without
+// paying the timeout again (re-probed after UNRESPONSIVE_RETRY_MS).
+async function collectPages(b: Browser): Promise<Page[]> {
+  const now = Date.now();
+  const targets = b.targets().filter((t) => t.type() === "page" && isAutomatableUrl(t.url()));
+  const results = await Promise.all(
+    targets.map(async (t) => {
+      const url = t.url();
+      const bad = unresponsive.get(url);
+      if (bad && now - bad.since < UNRESPONSIVE_RETRY_MS) return null;
+      try {
+        const p = await withTimeout(t.page(), ATTACH_TIMEOUT_MS, `attach ${url}`);
+        unresponsive.delete(url);
+        return p;
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        unresponsive.set(url, { url, since: now, reason });
+        // eslint-disable-next-line no-console
+        console.error(`[chrome-mcp] skipping unresponsive tab ${url}: ${reason}`);
+        return null;
+      }
+    }),
+  );
+  return results.filter((p): p is Page => !!p);
 }
 
 export async function listPages(): Promise<Page[]> {
   const b = await getBrowser();
-  const pages = await b.pages();
-  return pages.filter((p) => {
-    const url = p.url();
-    return !url.startsWith("devtools://") && !url.startsWith("chrome-extension://");
-  });
+  return collectPages(b);
+}
+
+// Page-free health probe for the `ping` tool: answers even when every tab is
+// wedged, so an agent can tell "server/Chrome down" from "one tab is stuck".
+export async function health(): Promise<{
+  ok: boolean;
+  session_id: string;
+  debug_port: number;
+  chrome: string | null;
+  browser_connected: boolean;
+  active_target_id: string | null;
+  active_tab_url: string | null;
+  unresponsive_tabs: Unresponsive[];
+  uptime_ms: number;
+  protocol_timeout_ms: number;
+}> {
+  let chrome: string | null = null;
+  try {
+    const res = await fetch(`http://${DEFAULT_HOST}:${DEFAULT_PORT}/json/version`, {
+      signal: AbortSignal.timeout(2_000),
+    });
+    if (res.ok) chrome = ((await res.json()) as { Browser?: string }).Browser ?? "unknown";
+  } catch { /* port down */ }
+  return {
+    ok: chrome !== null,
+    session_id: SESSION_ID,
+    debug_port: DEFAULT_PORT,
+    chrome,
+    browser_connected: !!browser?.connected,
+    active_target_id: activeTargetId,
+    active_tab_url: activePage && !activePage.isClosed() ? activePage.url() : null,
+    unresponsive_tabs: getUnresponsiveTabs(),
+    uptime_ms: Date.now() - startedAt,
+    protocol_timeout_ms: PROTOCOL_TIMEOUT_MS,
+  };
 }
 
 // Non-launching accessor: returns the current active page only if one is
@@ -377,12 +521,21 @@ export async function getActivePage(): Promise<Page> {
         owner = ownerSummary(locks[`${DEFAULT_PORT}:${tid}`]);
       } catch { /* page closed mid-scan */ }
       let focused = false;
-      try { focused = await p.evaluate(() => document.hasFocus()); } catch { /* skip */ }
-      return { page: p, owner, focused };
+      let responsive = true;
+      try {
+        focused = await withTimeout(p.evaluate(() => document.hasFocus()), ATTACH_TIMEOUT_MS, "focus probe");
+      } catch (err) {
+        if (err instanceof TimeoutError) {
+          responsive = false;
+          unresponsive.set(p.url(), { url: p.url(), since: Date.now(), reason: "focus probe did not answer" });
+        }
+      }
+      return { page: p, owner, focused, responsive };
     }),
   );
-  const mine = classified.filter((c) => c.owner?.mine);
-  const free = classified.filter((c) => !c.owner);
+  // Never auto-bind to a tab that didn't answer the probe (issue #54).
+  const mine = classified.filter((c) => c.responsive && c.owner?.mine);
+  const free = classified.filter((c) => c.responsive && !c.owner);
   // Prefer a tab we already own (focused first), then a free tab (focused first).
   const pick =
     mine.find((c) => c.focused)?.page || mine[0]?.page ||
@@ -391,10 +544,14 @@ export async function getActivePage(): Promise<Page> {
     const owners = classified
       .map((c) => (c.owner && !c.owner.mine ? formatOwner(c.owner.lock) : null))
       .filter((v): v is string => !!v);
+    const stuck = classified.filter((c) => !c.responsive).map((c) => c.page.url());
     throw new Error(
-      `The active tab was lost and every open tab is owned by another chrome-mcp session ` +
-        `(${owners.join("; ") || "unknown"}). Pick one explicitly with select_tab (and force/force_break_active ` +
-        `if you've coordinated with the user), or open a fresh tab with new_tab.`,
+      `The active tab was lost and no open tab is usable: ` +
+        (owners.length ? `${owners.length} owned by another chrome-mcp session (${owners.join("; ")})` : "") +
+        (owners.length && stuck.length ? "; " : "") +
+        (stuck.length ? `${stuck.length} not responding to CDP (frozen or paused in DevTools: ${stuck.join(", ")})` : "") +
+        `. Pick one explicitly with select_tab (force/force_break_active if you've coordinated with the user), ` +
+        `resume/reload the stuck tab, or open a fresh tab with new_tab.`,
     );
   }
   activePage = pick;

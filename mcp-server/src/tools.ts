@@ -69,8 +69,11 @@ import {
   getActivePage,
   getBrowser,
   getCdpPort,
+  getUnresponsiveTabs,
+  health,
   launchChrome,
   listPages,
+  withTimeout,
   selectPageByIndex,
   selectPageByUrlSubstring,
   setActivePage,
@@ -1248,13 +1251,31 @@ export const tools: Tool[] = [
           return {
             index: i,
             url: p.url(),
-            title: await p.title().catch(() => ""),
+            // A paused/frozen renderer never answers Runtime.evaluate; don't let
+            // one tab's title stall the whole listing (issue #54).
+            title: await withTimeout(p.title(), 3_000, "title").catch(() => ""),
             locked_by: lock ? formatOwner(lock) : null,
           };
         }),
       );
-      return json(info);
+      const skipped = getUnresponsiveTabs();
+      if (skipped.length === 0) return json(info);
+      return text(
+        JSON.stringify(info, null, 2) +
+          `\n\n[warning] ${skipped.length} tab(s) excluded because the renderer did not answer CDP attach (frozen page, "Page Unresponsive", or paused at a DevTools breakpoint): ` +
+          skipped.map((s) => `${s.url} (${s.reason})`).join("; ") +
+          `. They are not automatable until resumed/reloaded; close them in Chrome or resume the debugger. Re-probed automatically after 60s.`,
+      );
     },
+  },
+  {
+    name: "ping",
+    description:
+      "Health check that never touches a page: reports whether Chrome's debug port answers, whether this server is connected, the active tab, " +
+      "and any tabs currently skipped as unresponsive (frozen renderer / paused in DevTools). " +
+      "Call this when a tool call hung or timed out, to tell 'server/Chrome down' from 'one tab is stuck'. Read-only.",
+    schema: z.object({}),
+    handler: async () => json(await health()),
   },
   {
     name: "get_active_tab",

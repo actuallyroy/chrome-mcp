@@ -9,7 +9,10 @@ import { zodToJsonSchema } from "zod-to-json-schema";
 import { tools } from "./tools.js";
 import { recordCall } from "./recorder.js";
 import { recordTransition, flush as flushPageMap } from "./pagemap.js";
-import { getActivePageIfReady } from "./browser.js";
+import { getActivePageIfReady, TimeoutError, withTimeout } from "./browser.js";
+
+// Backstop deadline for any single tool call (see the CallTool handler).
+const TOOL_TIMEOUT_MS = Number(process.env.CHROME_MCP_TOOL_TIMEOUT_MS ?? 90_000);
 
 const server = new Server(
   { name: "chrome-mcp", version: "0.1.0" },
@@ -82,7 +85,24 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const __t0 = Date.now();
   try {
     const args = tool.schema.parse(rawArgs);
-    const result = await tool.handler(args as Record<string, unknown>);
+    // Hard deadline on every tool (issue #54). CDP commands are already bounded
+    // by protocolTimeout in browser.ts; this is the backstop for anything else
+    // so the agent always gets an error instead of an open-ended hang. Tools
+    // that legitimately wait (wait_for*, run_script, navigate with a long
+    // timeout) declare their own budget via args, so we take the larger.
+    const explicit = Number((args as Record<string, unknown>).timeout_ms ?? (args as Record<string, unknown>).timeout ?? 0);
+    const budget = Math.max(TOOL_TIMEOUT_MS, Number.isFinite(explicit) ? explicit + 10_000 : 0);
+    const result = await withTimeout(tool.handler(args as Record<string, unknown>), budget, `tool ${tool.name}`).catch((err) => {
+      if (err instanceof TimeoutError) {
+        throw new Error(
+          `${tool.name} exceeded the ${budget}ms hard deadline and was abandoned. ` +
+            `Chrome's debug port is usually still fine when this happens — one tab is frozen or paused at a DevTools breakpoint. ` +
+            `Call \`ping\` to check server health and see which tabs are being skipped as unresponsive, then \`list_tabs\`/\`select_tab\` to move to a healthy tab. ` +
+            `Raise the ceiling with CHROME_MCP_TOOL_TIMEOUT_MS if a tool legitimately needs longer.`,
+        );
+      }
+      throw err;
+    });
     appendTiming(result, Date.now() - __t0);
     const preview = result.content.find((c) => c.type === "text")?.text;
     recordCall(tool.name, args, !result.isError, preview);

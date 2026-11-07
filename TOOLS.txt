@@ -53,6 +53,7 @@
 - wait_for_selector
 - wait_for_navigation
 - launch_chrome
+- ping
 - list_tabs
 - select_tab
 - new_tab
