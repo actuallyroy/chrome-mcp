@@ -31,6 +31,9 @@ const DEFAULT_HOST = process.env.CHROME_DEBUG_HOST ?? "127.0.0.1";
 // probe (`ping`).
 const PROTOCOL_TIMEOUT_MS = Number(process.env.CHROME_MCP_PROTOCOL_TIMEOUT_MS ?? 30_000);
 const ATTACH_TIMEOUT_MS = Number(process.env.CHROME_MCP_ATTACH_TIMEOUT_MS ?? 5_000);
+// Bound the CDP handshake itself. puppeteer.connect() waits on its target
+// manager, not on a CDP command, so protocolTimeout cannot rescue it.
+const CONNECT_TIMEOUT_MS = Number(process.env.CHROME_MCP_CONNECT_TIMEOUT_MS ?? 20_000);
 // How long an unresponsive target stays blacklisted before we try it again.
 const UNRESPONSIVE_RETRY_MS = 60_000;
 
@@ -375,33 +378,60 @@ export async function getBrowser(): Promise<Browser> {
   // Skip DevTools frontends and extension pages at the connect layer so we
   // never attach to them, and bound every CDP command so a stuck renderer
   // surfaces as an error instead of an infinite hang (issue #54).
+  // puppeteer's target manager blocks connect() until every discovered page /
+  // iframe target reports as initialized, and PageTarget only reports that once
+  // its URL is non-empty (CdpTarget#_checkIfInitialized). A page target sitting
+  // with an empty URL therefore never initializes and connect() waits on it
+  // forever. That wait is not a CDP command, so protocolTimeout never fires and
+  // none of the per-target deadlines below ever get to run. Drop URL-less
+  // targets from the handshake, and bound connect() so any other target that
+  // never initializes fails loudly instead of wedging every tool call.
+  let connecting = true;
   const connectOpts = {
     browserURL,
     defaultViewport: null,
     protocolTimeout: PROTOCOL_TIMEOUT_MS,
-    targetFilter: (t: { url(): string }) => isAutomatableUrl(t.url()),
+    targetFilter: (t: { url(): string }) => {
+      const url = t.url();
+      if (!isAutomatableUrl(url)) return false;
+      if (connecting && url === "") return false;
+      return true;
+    },
   };
+  const connect = () =>
+    withTimeout(puppeteer.connect(connectOpts), CONNECT_TIMEOUT_MS, "Chrome CDP handshake");
   try {
-    browser = await puppeteer.connect(connectOpts);
-  } catch (firstErr) {
-    if (!autoSpawn) {
-      throw new Error(
-        `Could not connect to Chrome at ${browserURL}. ` +
-          `Launch it with --remote-debugging-port=${DEFAULT_PORT} or unset CHROME_MCP_NO_AUTOSPAWN.\n` +
-          `Underlying error: ${(firstErr as Error).message}`,
-      );
-    }
     try {
-      // eslint-disable-next-line no-console
-      console.error("[chrome-mcp] debug port not up — spawning Chrome…");
-      await launchChrome();
-      browser = await puppeteer.connect(connectOpts);
-    } catch (err) {
-      throw new Error(
-        `Auto-launch failed. ${(err as Error).message}\n` +
-          `You can launch Chrome manually and set CHROME_MCP_NO_AUTOSPAWN=1 to skip this path.`,
-      );
+      browser = await connect();
+    } catch (firstErr) {
+      if (firstErr instanceof TimeoutError) {
+        throw new Error(
+          `Chrome is listening on ${browserURL} but the CDP handshake did not finish ` +
+            `within ${CONNECT_TIMEOUT_MS}ms. A target never reported as initialized. ` +
+            `Call \`ping\` for server health, or raise CHROME_MCP_CONNECT_TIMEOUT_MS.`,
+        );
+      }
+      if (!autoSpawn) {
+        throw new Error(
+          `Could not connect to Chrome at ${browserURL}. ` +
+            `Launch it with --remote-debugging-port=${DEFAULT_PORT} or unset CHROME_MCP_NO_AUTOSPAWN.\n` +
+            `Underlying error: ${(firstErr as Error).message}`,
+        );
+      }
+      try {
+        // eslint-disable-next-line no-console
+        console.error("[chrome-mcp] debug port not up — spawning Chrome…");
+        await launchChrome();
+        browser = await connect();
+      } catch (err) {
+        throw new Error(
+          `Auto-launch failed. ${(err as Error).message}\n` +
+            `You can launch Chrome manually and set CHROME_MCP_NO_AUTOSPAWN=1 to skip this path.`,
+        );
+      }
     }
+  } finally {
+    connecting = false;
   }
   browser.on("disconnected", () => {
     browser = null;
