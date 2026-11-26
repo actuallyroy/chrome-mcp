@@ -57,6 +57,14 @@ Locator-taking tools accept `{ ref, text, label, selector }` — refs come from 
 - **Debug**: `pause`, `resume`, `inject_script`, `evaluate`
 - **Flows**: `start_recording`, `stop_recording`, `recording_status`, `run_script`, `assert`
 - **Cookies**: `get_cookies`, `set_cookies`
+- **Extensions**: `load_extension`, `list_extensions`, `reload_extension`, `extension_errors`, `extension_logs`, `extension_evaluate`, `extension_storage`, `open_extension_page`, `extension_activate`, `extension_manifest`
+- **Health**: `ping`, `get_active_tab`, `launch_chrome`
+
+#### Working on a Chrome extension
+
+`load_extension { path }` loads an unpacked extension (the directory with `manifest.json`) and returns its id. Google Chrome 137+ ignores `--load-extension`, so chrome-mcp uses the CDP `Extensions.loadUnpacked` command instead; that needs Chrome started with `--enable-unsafe-extension-debugging`, which `launch_chrome` passes. If Chrome was started some other way, quit it and call `launch_chrome` (optionally with `load_extensions: [path]`).
+
+The edit → check loop: change files, `reload_extension { id }` (a broken manifest or missing script comes back as the error), `extension_logs { id }` for service-worker and content-script console output, `extension_errors { id }` for what chrome://extensions lists under Errors. `extension_evaluate` runs code in the background context with the `chrome.*` APIs (`await` works). `open_extension_page { id, page: "popup" | "options" | "side_panel" | "any.html" }` opens the page as a normal tab so every other tool works on it. `mode: "popup"` / `mode: "panel"` open the real action popup or side panel instead and return their text + screenshot; pass `evaluate` to run JS inside the real view. `extension_activate { id }` fires `chrome.action.onClicked` for the tab you're driving (the "click the toolbar icon" moment for popup-less extensions) and can inject scripts into that tab via `chrome.scripting`.
 
 See [`examples/demo.flow.json`](./examples/demo.flow.json) for a sample `run_script` flow.
 

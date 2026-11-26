@@ -77,9 +77,25 @@ import {
   selectPageByIndex,
   selectPageByUrlSubstring,
   setActivePage,
+  targetIdFor,
   whoamiActiveTab,
 } from "./browser.js";
 import { formatOwner, listFreshLocks } from "./tab-lock.js";
+import {
+  activateExtension,
+  evalInBackground,
+  extensionStorage,
+  getExtensionErrors,
+  getExtensionLogs,
+  getManifest,
+  listExtensions,
+  loadUnpacked,
+  openExtensionPage,
+  reloadExtension,
+  setExtensionEnabled,
+  summarizeExtension,
+  summarizeManifest,
+} from "./extensions.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileFeedback } from "./feedback.js";
@@ -1220,11 +1236,218 @@ export const tools: Tool[] = [
     name: "launch_chrome",
     description:
       "Explicitly launch Chrome with remote debugging enabled, using a dedicated profile at ~/ChromeMCP-Profile. Normally not needed — the first tool call auto-spawns Chrome if the debug port isn't up. First run creates an empty profile; sign into the sites you want to drive, and the session persists.",
-    schema: z.object({ headless: z.boolean().default(false) }),
+    schema: z.object({
+      headless: z.boolean().default(false),
+      load_extensions: z
+        .array(z.string())
+        .optional()
+        .describe("Directories of unpacked extensions to load right after launch (each must contain manifest.json). Same as calling load_extension for each."),
+    }),
     handler: async (args) => {
-      const { headless } = args as { headless: boolean };
+      const { headless, load_extensions } = args as { headless: boolean; load_extensions?: string[] };
       const r = await launchChrome({ headless });
-      return json(r);
+      if (!load_extensions?.length) return json(r);
+      const loaded = [];
+      for (const dir of load_extensions) {
+        try {
+          loaded.push(await loadUnpacked(dir));
+        } catch (err) {
+          loaded.push({ path: dir, error: (err as Error).message });
+        }
+      }
+      return json({ ...r, extensions: loaded });
+    },
+  },
+
+  // ---- Extensions ----------------------------------------------------------
+  {
+    name: "load_extension",
+    description:
+      "Load an unpacked extension from a directory (the folder holding manifest.json — for a bundled extension, its build output). " +
+      "Returns the extension id and a manifest summary. Loading the same path again reloads it under the same id. " +
+      "Uses CDP Extensions.loadUnpacked, which needs Chrome started by chrome-mcp (launch_chrome adds --enable-unsafe-extension-debugging); " +
+      "Google Chrome 137+ ignores --load-extension, so this is the only automated way in. " +
+      "After loading: open_extension_page for the popup/options UI, extension_logs for service-worker output, extension_evaluate to call chrome.* APIs.",
+    schema: z.object({ path: z.string().describe("Absolute or cwd-relative path to the extension directory") }),
+    handler: async (args) => json(await loadUnpacked((args as { path: string }).path)),
+  },
+  {
+    name: "list_extensions",
+    description:
+      "List installed extensions with id, name, version, enabled state, install location (UNPACKED / FROM_STORE), unpacked path, " +
+      "whether the background service worker is currently running, open extension views, and manifest/runtime error counts. " +
+      "Reads chrome://extensions' own data, so it sees disabled extensions and idle workers too. Set `all:true` to include Chrome's built-in component extensions.",
+    schema: z.object({ all: z.boolean().default(false) }),
+    handler: async (args) => {
+      const { all } = args as { all: boolean };
+      const list = (await listExtensions()).filter((e) => all || (e.location !== "COMPONENT" && e.type !== "THEME"));
+      return json(list.map(summarizeExtension));
+    },
+  },
+  {
+    name: "reload_extension",
+    description:
+      "Reload an extension (same as the ↻ button on chrome://extensions). For unpacked extensions this picks up changed files and " +
+      "returns the manifest/load error with a source excerpt if the reload fails — use it as the edit→reload→check loop. " +
+      "Also accepts `enabled: true|false` to enable/disable instead of reloading.",
+    schema: z.object({
+      id: z.string().describe("Extension id (32 letters, from load_extension / list_extensions)"),
+      enabled: z.boolean().optional().describe("If given, enable/disable the extension instead of reloading it"),
+    }),
+    handler: async (args) => {
+      const { id, enabled } = args as { id: string; enabled?: boolean };
+      if (typeof enabled === "boolean") {
+        const err = await setExtensionEnabled(id, enabled);
+        if (err) throw new Error(err);
+        return text(`${enabled ? "Enabled" : "Disabled"} ${id}`);
+      }
+      const r = await reloadExtension(id);
+      if (r.ok) return text(`Reloaded ${id}${r.path ? ` from ${r.path}` : ""}. Background worker restarts on first use; extension_logs captures its boot output.`);
+      return {
+        ...json({ reloaded: false, error: r.error, ...(r.path ? { path: r.path } : {}), hint: "The extension stays unloaded until a reload succeeds. Fix the error and call reload_extension again." }),
+        isError: true,
+      };
+    },
+  },
+  {
+    name: "extension_errors",
+    description:
+      "Manifest and runtime errors Chrome has recorded for an extension — the same list chrome://extensions shows under 'Errors', " +
+      "with message, source file, severity, occurrence count and stack. `clear:true` empties the list after reading so the next check is fresh.",
+    schema: z.object({ id: z.string(), clear: z.boolean().default(false) }),
+    handler: async (args) => {
+      const { id, clear } = args as { id: string; clear: boolean };
+      return json(await getExtensionErrors(id, clear));
+    },
+  },
+  {
+    name: "extension_evaluate",
+    description:
+      "Evaluate JavaScript inside the extension's background context (MV3 service worker or MV2 background page), where the chrome.* APIs live. " +
+      "Promises are awaited and the result returned by value. Wakes an idle service worker first. " +
+      "Examples: `chrome.runtime.getManifest()`, `chrome.tabs.query({})`, `chrome.storage.local.get()`, `chrome.runtime.reload()`, " +
+      "`chrome.scripting.executeScript({target:{tabId:1}, func:()=>document.title})`. For page UI use open_extension_page + the normal tools.",
+    schema: z.object({
+      id: z.string(),
+      expression: z.string(),
+      timeout_ms: z.number().int().min(100).max(120_000).default(30_000),
+    }),
+    handler: async (args) => {
+      const { id, expression, timeout_ms } = args as { id: string; expression: string; timeout_ms: number };
+      const v = await evalInBackground(id, expression, timeout_ms);
+      return text(v === undefined ? "undefined" : typeof v === "string" ? v : JSON.stringify(v, null, 2));
+    },
+  },
+  {
+    name: "extension_logs",
+    description:
+      "Console output and uncaught exceptions from an extension's background context (service worker / background page) and from its " +
+      "content scripts in open tabs, tagged with source and timestamp. Capture starts the first time any extension tool mentions the id " +
+      "(load_extension captures boot output), and persists across reloads. Note: capturing keeps an MV3 service worker alive (DevTools is attached), " +
+      "so idle-termination behaviour can't be observed while this is on. Filter with level (e.g. 'error,exception') and source.",
+    schema: z.object({
+      id: z.string(),
+      clear: z.boolean().default(false),
+      level: z.string().optional().describe("comma-separated: log,info,warning,error,debug,exception"),
+      source: z.string().optional().describe("comma-separated: service_worker,background_page,content_script"),
+      limit: z.number().int().min(1).max(500).default(100),
+    }),
+    handler: async (args) => {
+      const { id, clear, level, source, limit } = args as { id: string; clear: boolean; level?: string; source?: string; limit: number };
+      // Touching the background attaches capture if it isn't yet (and wakes the worker).
+      await getManifest(id).catch(() => undefined);
+      const logs = getExtensionLogs(id, {
+        clear,
+        limit,
+        level: level ? level.split(",").map((s) => s.trim()) : undefined,
+        source: source ? source.split(",").map((s) => s.trim()) : undefined,
+      });
+      if (logs.length === 0) return text("(no captured extension logs yet — capture is attached now; trigger the behaviour and call again)");
+      return text(logs.map((l) => `[${new Date(l.ts).toISOString().slice(11, 23)}] ${l.source} ${l.level}: ${l.text}`).join("\n"));
+    },
+  },
+  {
+    name: "extension_storage",
+    description:
+      "Read or write the extension's chrome.storage (local / sync / session / managed) via its background context. " +
+      "get with no keys returns everything; set merges `values`; remove deletes `keys`; clear empties the area.",
+    schema: z.object({
+      id: z.string(),
+      area: z.enum(["local", "sync", "session", "managed"]).default("local"),
+      action: z.enum(["get", "set", "remove", "clear"]).default("get"),
+      keys: z.array(z.string()).optional(),
+      values: z.record(z.unknown()).optional(),
+    }),
+    handler: async (args) => {
+      const { id, area, action, keys, values } = args as {
+        id: string;
+        area: "local" | "sync" | "session" | "managed";
+        action: "get" | "set" | "remove" | "clear";
+        keys?: string[];
+        values?: Record<string, unknown>;
+      };
+      return json(await extensionStorage(id, area, action, keys, values));
+    },
+  },
+  {
+    name: "open_extension_page",
+    description:
+      "Open one of the extension's pages. `page` is \"popup\", \"options\" or \"side_panel\" (resolved from the manifest) or a path inside the extension like \"panel.html\". " +
+      "mode:\"tab\" (default) opens it in a normal tab bound as the active tab, so click/fill/outline/screenshot/get_console all work — same code as the real view. " +
+      "mode:\"popup\" opens the REAL action popup (chrome.action.openPopup), mode:\"panel\" the REAL side panel (chrome.sidePanel.open against the active tab). " +
+      "Real views come back as rendered text + screenshot; Chrome exposes them as non-page targets, so they can't be bound as the active tab — " +
+      "pass `evaluate` to run JS inside the view instead (e.g. `document.querySelector('button').click()`); each call re-snapshots after evaluating. " +
+      "The popup closes when focus moves; the side panel stays open.",
+    schema: z.object({
+      id: z.string(),
+      page: z.string().default("popup"),
+      mode: z.enum(["tab", "popup", "panel"]).default("tab"),
+      evaluate: z.string().optional().describe("JS to run inside the real popup/panel view (mode popup/panel only); result is returned and the view re-snapshotted"),
+    }),
+    handler: async (args) => {
+      const { id, page, mode, evaluate } = args as { id: string; page: string; mode: "tab" | "popup" | "panel"; evaluate?: string };
+      const r = await openExtensionPage(id, page, mode, evaluate);
+      if (!r.screenshot_png_base64) return json(r);
+      const { screenshot_png_base64, ...rest } = r;
+      const { b64, width, height } = resizePngBase64(screenshot_png_base64, 800);
+      return {
+        content: [
+          { type: "text", text: JSON.stringify(rest, null, 2) },
+          { type: "image", data: b64, mimeType: "image/png" },
+          { type: "text", text: `${mode} screenshot ${width}x${height}` },
+        ],
+      };
+    },
+  },
+  {
+    name: "extension_activate",
+    description:
+      "\"Click the extension's toolbar icon\" on the tab chrome-mcp is driving: fires chrome.action.onClicked with the real Tab object — what popup-less extensions react to " +
+      "(inject their UI/modal, start a scan, toggle state). Optionally inject into that tab via chrome.scripting.executeScript (`inject_files` from the extension, or `inject_code`), " +
+      "the way activeTab-style extensions do on click. Caveat: a dispatched click is not a real user gesture, so it does NOT grant the activeTab permission — injection needs " +
+      "host_permissions covering the page (add one for development). Anything the extension puts in the page is then visible to outline/click/screenshot as usual.",
+    schema: z.object({
+      id: z.string(),
+      click: z.boolean().default(true).describe("Fire chrome.action.onClicked for the active tab"),
+      inject_files: z.array(z.string()).optional().describe("Extension-relative script files to inject into the active tab"),
+      inject_code: z.string().optional().describe("Function body to inject into the active tab (runs as a function)"),
+      world: z.enum(["ISOLATED", "MAIN"]).optional(),
+    }),
+    handler: async (args) => {
+      const { id, click, inject_files, inject_code, world } = args as {
+        id: string; click: boolean; inject_files?: string[]; inject_code?: string; world?: "ISOLATED" | "MAIN";
+      };
+      return json(await activateExtension(id, { click, inject_files, inject_code, world }));
+    },
+  },
+  {
+    name: "extension_manifest",
+    description: "Return a summary of an installed extension's manifest (background type, popup/options pages, content script count, permissions). Full manifest with `full:true`.",
+    schema: z.object({ id: z.string(), full: z.boolean().default(false) }),
+    handler: async (args) => {
+      const { id, full } = args as { id: string; full: boolean };
+      const m = await getManifest(id);
+      return json(full ? m : summarizeManifest(m));
     },
   },
 
@@ -1242,10 +1465,7 @@ export const tools: Tool[] = [
         pages.map(async (p, i) => {
           let targetId: string | null = null;
           try {
-            const cdp = await p.createCDPSession();
-            const { targetInfo } = (await cdp.send("Target.getTargetInfo")) as { targetInfo: { targetId: string } };
-            targetId = targetInfo.targetId;
-            await cdp.detach().catch(() => {});
+            targetId = await targetIdFor(p);
           } catch { /* ignore */ }
           const lock = targetId ? locks[`${port}:${targetId}`] : undefined;
           return {

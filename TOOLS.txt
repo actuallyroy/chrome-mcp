@@ -54,6 +54,16 @@
 - wait_for_navigation
 - launch_chrome
 - ping
+- load_extension
+- list_extensions
+- reload_extension
+- extension_errors
+- extension_evaluate
+- extension_logs
+- extension_storage
+- open_extension_page
+- extension_manifest
+- extension_activate
 - list_tabs
 - select_tab
 - new_tab

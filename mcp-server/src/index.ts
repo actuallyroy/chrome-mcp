@@ -92,8 +92,11 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
     // timeout) declare their own budget via args, so we take the larger.
     const explicit = Number((args as Record<string, unknown>).timeout_ms ?? (args as Record<string, unknown>).timeout ?? 0);
     const budget = Math.max(TOOL_TIMEOUT_MS, Number.isFinite(explicit) ? explicit + 10_000 : 0);
-    const result = await withTimeout(tool.handler(args as Record<string, unknown>), budget, `tool ${tool.name}`).catch((err) => {
-      if (err instanceof TimeoutError) {
+    const deadlineLabel = `tool ${tool.name} hard deadline`;
+    const result = await withTimeout(tool.handler(args as Record<string, unknown>), budget, deadlineLabel).catch((err) => {
+      // Only OUR deadline gets the "server wedged" guidance; a TimeoutError from
+      // an inner bounded step (attach, probe) already carries its own message.
+      if (err instanceof TimeoutError && err.message.startsWith(deadlineLabel)) {
         throw new Error(
           `${tool.name} exceeded the ${budget}ms hard deadline and was abandoned. ` +
             `Chrome's debug port is usually still fine when this happens — one tab is frozen or paused at a DevTools breakpoint. ` +

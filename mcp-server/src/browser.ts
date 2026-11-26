@@ -4,6 +4,7 @@ import { homedir, platform } from "node:os";
 import { join } from "node:path";
 import puppeteer, { Browser, Page } from "puppeteer-core";
 import { INSTRUMENTATION_SCRIPT } from "./instrumentation.js";
+import { attachContentScriptCapture, watchExtensionTargets } from "./extensions.js";
 import {
   SESSION_ID,
   acquireLock,
@@ -42,6 +43,14 @@ export function getCdpPort(): number {
   return DEFAULT_PORT;
 }
 
+export function getBrowserURL(): string {
+  return `http://${DEFAULT_HOST}:${DEFAULT_PORT}`;
+}
+
+export function getProtocolTimeout(): number {
+  return PROTOCOL_TIMEOUT_MS;
+}
+
 export class TimeoutError extends Error {
   constructor(label: string, ms: number) {
     super(`${label} did not complete within ${ms}ms`);
@@ -67,27 +76,33 @@ export function getUnresponsiveTabs(): Unresponsive[] {
   return [...unresponsive.values()];
 }
 
+// DevTools frontends are never automatable. Extension pages (popup, options,
+// any chrome-extension:// tab) are ordinary pages — see extensions.ts.
 function isAutomatableUrl(url: string): boolean {
-  return !url.startsWith("devtools://") && !url.startsWith("chrome-extension://");
+  return !url.startsWith("devtools://");
 }
 
 const targetIdCache = new WeakMap<Page, string>();
 
-async function targetIdFor(page: Page): Promise<string> {
+export async function targetIdFor(page: Page): Promise<string> {
   const cached = targetIdCache.get(page);
   if (cached) return cached;
-  // Prefer CDP query — `Target._targetId` is internal in puppeteer-core and
-  // varies across versions. `Target.getTargetInfo` is part of the protocol.
-  const cdp = await page.createCDPSession();
-  try {
-    const { targetInfo } = (await cdp.send("Target.getTargetInfo")) as {
-      targetInfo: { targetId: string };
-    };
-    targetIdCache.set(page, targetInfo.targetId);
-    return targetInfo.targetId;
-  } finally {
-    try { await cdp.detach(); } catch { /* ignore */ }
+  // puppeteer's Target carries the id; use it when present. The CDP fallback
+  // deliberately does NOT detach its session: puppeteer's target manager drops
+  // a target from browser.targets() when ANY session attached to it detaches
+  // (ChromeTargetManager#onDetachedFromTarget), which made the tab we had just
+  // claimed vanish from listPages() and the next call open a fresh about:blank.
+  const internal = (page.target() as unknown as { _targetId?: string })._targetId;
+  if (internal) {
+    targetIdCache.set(page, internal);
+    return internal;
   }
+  const cdp = await page.createCDPSession();
+  const { targetInfo } = (await cdp.send("Target.getTargetInfo")) as {
+    targetInfo: { targetId: string };
+  };
+  targetIdCache.set(page, targetInfo.targetId);
+  return targetInfo.targetId;
 }
 
 async function claimPage(page: Page, force: boolean | "break_active" = false): Promise<void> {
@@ -211,6 +226,11 @@ export async function launchChrome(opts: { headless?: boolean } = {}): Promise<{
     "--disable-background-timer-throttling",
     "--disable-backgrounding-occluded-windows",
     "--disable-renderer-backgrounding",
+    // Branded Chrome dropped --load-extension in M137; the supported path is
+    // the CDP Extensions.loadUnpacked command, which this flag enables. The
+    // debug port is already loopback-only full control, so nothing new is
+    // exposed. Powers load_extension.
+    "--enable-unsafe-extension-debugging",
   ];
   if (opts.headless) args.push("--headless=new");
   const child = spawn(bin, args, {
@@ -302,6 +322,9 @@ async function attachInstrumentation(page: Page) {
     // some CDP targets don't support this; fall back to per-call injection
   }
   attachDialogHandler(page);
+  // Content-script console/exception capture for extension_logs (isolated
+  // worlds are invisible to the in-page console hook).
+  withTimeout(attachContentScriptCapture(page), ATTACH_TIMEOUT_MS, "content-script capture").catch(() => {});
 }
 
 export async function ensureInstrumentation(page: Page) {
@@ -397,6 +420,7 @@ export async function getBrowser(): Promise<Browser> {
       // ignore
     }
   });
+  watchExtensionTargets(browser);
   // Attach in parallel with a per-target deadline; one stuck tab must not
   // block connecting to the rest (issue #54).
   const pages = await collectPages(browser);
